@@ -1,10 +1,18 @@
+from pathlib import Path
+import sys
 
-
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# Путь к файлу
-file_path = r'C:\Users\RobotComp.ru\Desktop\projects\EIKGPRegressor\data\CaliforniaHousing.csv'
+# Пути вычисляются от расположения этого файла, а не от текущей рабочей директории.
+project_root = Path(__file__).resolve().parents[1]
+file_path = project_root / "data" / "CaliforniaHousing.csv"
+
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+if not file_path.is_file():
+    raise FileNotFoundError(f"Датасет не найден: {file_path}")
 
 # Загрузка датасета
 df = pd.read_csv(file_path)
@@ -244,11 +252,12 @@ X_train_scaled
 
 
 
-import numpy as np
-import pandas as pd
-
-# from eikg import EIKGPolynomialRegressor
-from eikg.regressors import EIKGPolynomialRegressor
+from eikg import (
+    DeepPolyNetwork,
+    DeepPolyNetworkCV,
+    EIKGPolynomialRegressor,
+    EIKGPolynomialRegressorCV,
+)
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, mean_squared_error, r2_score
 
 # --- Ожидается, что у тебя уже есть:
@@ -259,10 +268,33 @@ from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error,
 
 n_features = X_train.shape[1]
 
+# Степень одиночного полинома выбирается только по CV MSE на обучающей выборке.
+polynomial_selector = EIKGPolynomialRegressorCV(
+    max_degree=n_features,
+    cv=5,
+    scoring="neg_mean_squared_error",
+    regularization="ridge",
+    alpha_ridge=1e-6,
+    fit_intercept=True,
+    scale=True,
+    normalize_latent=True,
+    scale_y=False,
+    check_input=True,
+).fit(X_train_scaled, y_train)
+
+polynomial_cv_results = pd.DataFrame({
+    "degree": np.arange(1, n_features + 1),
+    # Класс хранит отрицательный MSE, поскольку при выборе максимизируется score.
+    "CV_MSE": -np.asarray(polynomial_selector.cv_scores_),
+}).sort_values("CV_MSE", ascending=True)
+
+print("\nCV MSE одиночных полиномов:")
+print(polynomial_cv_results.reset_index(drop=True))
+
 results = []
 predictions_by_degree = {}
 
-for degree in range(2, n_features + 1):
+for degree in range(1, n_features + 1):
     model = EIKGPolynomialRegressor(
         degree=degree,
         regularization="ridge",   # можно "none"
@@ -297,6 +329,99 @@ for degree in range(2, n_features + 1):
 results_df = pd.DataFrame(results).sort_values("degree").reset_index(drop=True)
 # display(results_df)
 print(results_df)
-best_idx = results_df["R2"].idxmax()
-best_degree = int(results_df.loc[best_idx, "degree"])
-print(f"Лучшая степень по R2: {best_degree}")
+best_degree = polynomial_selector.selected_degree_
+best_idx = int(results_df.index[results_df["degree"] == best_degree][0])
+print(f"Лучшая степень по минимальному CV MSE: {best_degree}")
+print(f"Минимальный CV MSE: {-polynomial_selector.best_score_}")
+
+
+# Сначала CV-сеть выбирает отдельную степень каждого слоя по минимальному
+# fold-local CV MSE. Затем тот же кортеж явно используется в DeepPolyNetwork.
+network_cv_model = DeepPolyNetworkCV(
+    n_layers=3,
+    max_degree=3,
+    cv=3,
+    scoring="neg_mean_squared_error",
+    shuffle=True,
+    random_state=42,
+    regularization="ridge",
+    alpha_ridge=1e-6,
+    fit_intercept=True,
+    scale=True,
+    scale_y=True,
+    normalize_latent=True,
+)
+
+print("\nПодбор степеней DeepPolyNetworkCV по минимальному CV MSE...")
+network_cv_model.fit(X_train_scaled, y_train)
+
+network_model = DeepPolyNetwork(
+    n_layers=network_cv_model.n_layers_,
+    degree=network_cv_model.selected_degrees_,
+    regularization="ridge",
+    alpha_ridge=1e-6,
+    fit_intercept=True,
+    scale=True,
+    scale_y=True,
+    normalize_latent=True,
+)
+
+print("\nОбучение DeepPolyNetwork с выбранными CV степенями...")
+network_model.fit(X_train_scaled, y_train)
+
+network_models = {
+    "DeepPolyNetwork": network_model,
+    "DeepPolyNetworkCV": network_cv_model,
+}
+
+network_results = []
+network_predictions = {}
+
+for model_name, network_model in network_models.items():
+    network_prediction = network_model.predict(X_test_scaled)
+
+    network_mse = mean_squared_error(y_test, network_prediction)
+    network_results.append({
+        "model": model_name,
+        "degrees": network_model.degrees_
+        if isinstance(network_model, DeepPolyNetwork)
+        else network_model.selected_degrees_,
+        "MAE": mean_absolute_error(y_test, network_prediction),
+        "MAPE": mean_absolute_percentage_error(y_test, network_prediction),
+        "MSE": network_mse,
+        "RMSE": np.sqrt(network_mse),
+        "R2": r2_score(y_test, network_prediction),
+    })
+    network_predictions[model_name] = network_prediction
+
+network_results_df = pd.DataFrame(network_results)
+
+print("\nРезультаты полиномиальных сетей:")
+print(network_results_df)
+
+print("\nСтепени, выбранные DeepPolyNetworkCV:")
+print(network_models["DeepPolyNetworkCV"].selected_degrees_)
+
+network_layer_cv_results = pd.DataFrame({
+    "layer": np.arange(1, network_cv_model.n_layers_ + 1),
+    "selected_degree": network_cv_model.selected_degrees_,
+    "CV_MSE": -np.asarray(network_cv_model.layer_best_scores_),
+})
+
+print("\nМинимальный CV MSE на каждом слое DeepPolyNetworkCV:")
+print(network_layer_cv_results)
+
+best_polynomial_result = results_df.loc[[best_idx]].copy()
+best_polynomial_result.insert(0, "model", "EIKGPolynomialRegressor")
+best_polynomial_result["degrees"] = best_polynomial_result["degree"].map(
+    lambda degree: (int(degree),)
+)
+
+comparison_columns = ["model", "degrees", "MAE", "MAPE", "MSE", "RMSE", "R2"]
+comparison_df = pd.concat(
+    [best_polynomial_result[comparison_columns], network_results_df[comparison_columns]],
+    ignore_index=True,
+).sort_values("MSE", ascending=True)
+
+print("\nИтоговое сравнение моделей (лучшие по test MSE сверху):")
+print(comparison_df.reset_index(drop=True))

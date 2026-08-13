@@ -8,13 +8,15 @@ The format is based on Keep a Changelog, and the project adheres to Semantic Ver
 
 ### Added
 
-- `PolynomialNetwork`, a fixed-width cascade of independently fitted
+- `DeepPolyNetwork`, a fixed-width cascade of independently fitted
   `EIKGPolynomialRegressor` layers with an explicit `n_layers` parameter.
+- Canonical `DeepPolyNetwork` and `DeepPolyNetworkCV` public names; the former
+  `PolynomialNetwork` and `PolynomialNetworkCV` names remain backward-compatible aliases.
 - Train-only max-absolute scaling for original features and intermediate predictions before
   constructing successive layer inputs.
-- Scalar or per-layer degree configurations for `PolynomialNetwork`, with canonical fitted
+- Scalar or per-layer degree configurations for `DeepPolyNetwork`, with canonical fitted
   `degrees_` metadata.
-- `PolynomialNetworkCV` for leakage-safe greedy selection of a separate degree at every layer,
+- `DeepPolyNetworkCV` for leakage-safe greedy selection of a separate degree at every layer,
   fold-local prefix construction, and a final refit on all supplied training data.
 - Per-layer CV diagnostics: `selected_degrees_`, `layer_cv_scores_`,
   `layer_cv_fold_scores_`, and `layer_best_scores_`.

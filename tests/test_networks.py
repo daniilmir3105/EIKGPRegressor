@@ -7,7 +7,12 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
-from eikg import PolynomialNetwork, PolynomialNetworkCV
+from eikg import (
+    DeepPolyNetwork,
+    DeepPolyNetworkCV,
+    PolynomialNetwork,
+    PolynomialNetworkCV,
+)
 from eikg.metrics import mean_squared_error, r2_score
 from eikg.regressors import EIKGPolynomialRegressor
 
@@ -75,7 +80,7 @@ def manual_greedy_prefix_cv(
             candidate_degrees = (*selected_degrees, candidate_degree)
             fold_scores: list[float] = []
             for train_indices, validation_indices in splits:
-                candidate = PolynomialNetwork(
+                candidate = DeepPolyNetwork(
                     n_layers=layer_index + 1,
                     degree=candidate_degrees,
                     **network_parameters,
@@ -103,7 +108,7 @@ def manual_greedy_prefix_cv(
 
 
 def test_network_constructor_exposes_documented_defaults() -> None:
-    model = PolynomialNetwork()
+    model = DeepPolyNetwork()
 
     assert model.n_layers == 3
     assert model.degree == 2
@@ -119,7 +124,7 @@ def test_network_constructor_exposes_documented_defaults() -> None:
     assert model.lstsq_rcond is None
     assert not hasattr(model, "layers_")
 
-    cv_model = PolynomialNetworkCV()
+    cv_model = DeepPolyNetworkCV()
     assert cv_model.n_layers == 3
     assert cv_model.max_degree == 6
     assert cv_model.scoring == "neg_mean_squared_error"
@@ -130,20 +135,39 @@ def test_network_constructor_exposes_documented_defaults() -> None:
     assert not hasattr(cv_model, "estimator_")
 
 
+def test_legacy_polynomial_network_names_are_exact_public_aliases() -> None:
+    assert PolynomialNetwork is DeepPolyNetwork
+    assert PolynomialNetworkCV is DeepPolyNetworkCV
+
+    x, y = make_data(n_samples=30)
+    parameters = {"n_layers": 2, "degree": (1, 2), "alpha_ridge": 1e-6}
+    canonical = DeepPolyNetwork(**parameters).fit(x, y)
+    legacy = PolynomialNetwork(**parameters).fit(x, y)
+
+    assert legacy.__class__ is DeepPolyNetwork
+    assert legacy.get_params(deep=False) == canonical.get_params(deep=False)
+    np.testing.assert_allclose(legacy.predict(x), canonical.predict(x), rtol=0.0, atol=0.0)
+
+    canonical_cv = DeepPolyNetworkCV(n_layers=1, max_degree=1, cv=2)
+    legacy_cv = PolynomialNetworkCV(n_layers=1, max_degree=1, cv=2)
+    assert legacy_cv.__class__ is DeepPolyNetworkCV
+    assert legacy_cv.get_params(deep=False) == canonical_cv.get_params(deep=False)
+
+
 @pytest.mark.parametrize("n_layers", [0, -1, 1.5, True, "2", None])
 def test_network_rejects_invalid_n_layers(n_layers: Any) -> None:
     x, y = make_data(n_samples=20)
 
     with pytest.raises((TypeError, ValueError), match="n_layers"):
-        PolynomialNetwork(n_layers=n_layers).fit(x, y)
+        DeepPolyNetwork(n_layers=n_layers).fit(x, y)
 
     with pytest.raises((TypeError, ValueError), match="n_layers"):
-        PolynomialNetworkCV(n_layers=n_layers, max_degree=1, cv=2).fit(x, y)
+        DeepPolyNetworkCV(n_layers=n_layers, max_degree=1, cv=2).fit(x, y)
 
 
 def test_network_scalar_degree_is_broadcast_to_all_layers() -> None:
     x, y = make_data(n_samples=40)
-    model = PolynomialNetwork(n_layers=3, degree=2).fit(x, y)
+    model = DeepPolyNetwork(n_layers=3, degree=2).fit(x, y)
 
     assert tuple(model.degrees_) == (2, 2, 2)
     assert tuple(layer.degree_ for layer in model.layers_) == model.degrees_
@@ -152,7 +176,7 @@ def test_network_scalar_degree_is_broadcast_to_all_layers() -> None:
 def test_network_accepts_one_degree_per_layer() -> None:
     x, y = make_data(n_samples=50)
     degrees = (1, 3, 2)
-    model = PolynomialNetwork(n_layers=3, degree=degrees).fit(x, y)
+    model = DeepPolyNetwork(n_layers=3, degree=degrees).fit(x, y)
 
     assert model.degree == degrees
     assert tuple(model.degrees_) == degrees
@@ -165,7 +189,7 @@ def test_network_accepts_one_degree_per_layer() -> None:
 
 def test_network_reports_common_legacy_degree_for_a_uniform_sequence() -> None:
     x, y = make_data(n_samples=32)
-    model = PolynomialNetwork(n_layers=3, degree=(2, 2, 2)).fit(x, y)
+    model = DeepPolyNetwork(n_layers=3, degree=(2, 2, 2)).fit(x, y)
 
     assert model.degrees_ == (2, 2, 2)
     assert model.degree_ == 2
@@ -189,13 +213,13 @@ def test_network_rejects_invalid_degree_sequences(degree: Any) -> None:
     x, y = make_data(n_samples=20)
 
     with pytest.raises((TypeError, ValueError), match="degree"):
-        PolynomialNetwork(n_layers=3, degree=degree).fit(x, y)
+        DeepPolyNetwork(n_layers=3, degree=degree).fit(x, y)
 
 
 @pytest.mark.parametrize("n_layers", [1, 3])
 def test_network_fit_predict_and_fitted_state(n_layers: int) -> None:
     x, y = make_data()
-    model = PolynomialNetwork(n_layers=n_layers, degree=3, alpha_ridge=1e-6)
+    model = DeepPolyNetwork(n_layers=n_layers, degree=3, alpha_ridge=1e-6)
 
     returned = model.fit(x, y)
     prediction = model.predict(x)
@@ -226,7 +250,7 @@ def test_network_fit_predict_and_fitted_state(n_layers: int) -> None:
 def test_network_prediction_follows_fixed_width_layer_architecture() -> None:
     x, y = make_data(n_samples=60)
     degrees = (1, 3, 2, 1)
-    model = PolynomialNetwork(n_layers=4, degree=degrees, alpha_ridge=1e-6).fit(x, y)
+    model = DeepPolyNetwork(n_layers=4, degree=degrees, alpha_ridge=1e-6).fit(x, y)
 
     assert tuple(layer.degree_ for layer in model.layers_) == degrees
 
@@ -248,11 +272,11 @@ def test_network_repeated_fit_replaces_all_learned_layers() -> None:
     x_first, y_first = make_data(n_samples=50, n_features=3, seed=31)
     x_second, y_second = make_data(n_samples=65, n_features=2, seed=32)
     parameters = {"n_layers": 3, "degree": 2, "alpha_ridge": 1e-6}
-    model = PolynomialNetwork(**parameters).fit(x_first, y_first)
+    model = DeepPolyNetwork(**parameters).fit(x_first, y_first)
     old_layers = tuple(model.layers_)
 
     model.fit(x_second, y_second)
-    fresh_model = PolynomialNetwork(**parameters).fit(x_second, y_second)
+    fresh_model = DeepPolyNetwork(**parameters).fit(x_second, y_second)
 
     assert len(model.layers_) == parameters["n_layers"]
     assert model.n_features_in_ == x_second.shape[1]
@@ -267,7 +291,7 @@ def test_network_repeated_fit_replaces_all_learned_layers() -> None:
 
 def test_network_unfitted_predict_and_score_raise() -> None:
     x, y = make_data(n_samples=12)
-    model = PolynomialNetwork()
+    model = DeepPolyNetwork()
 
     with pytest.raises(RuntimeError, match="not fitted"):
         model.predict(x)
@@ -284,9 +308,9 @@ def test_network_rejects_nonfinite_training_data(bad_value: float) -> None:
     bad_y[0] = bad_value
 
     with pytest.raises(ValueError, match="X contains"):
-        PolynomialNetwork(n_layers=2).fit(bad_x, y)
+        DeepPolyNetwork(n_layers=2).fit(bad_x, y)
     with pytest.raises(ValueError, match="y contains"):
-        PolynomialNetwork(n_layers=2).fit(x, bad_y)
+        DeepPolyNetwork(n_layers=2).fit(x, bad_y)
 
 
 @pytest.mark.parametrize(
@@ -302,12 +326,12 @@ def test_network_rejects_nonfinite_training_data(bad_value: float) -> None:
 )
 def test_network_rejects_invalid_training_shapes(bad_x: Any, bad_y: Any) -> None:
     with pytest.raises(ValueError):
-        PolynomialNetwork(n_layers=1).fit(bad_x, bad_y)
+        DeepPolyNetwork(n_layers=1).fit(bad_x, bad_y)
 
 
 def test_network_validates_predict_features_and_values() -> None:
     x, y = make_data(n_samples=30)
-    model = PolynomialNetwork(n_layers=2).fit(x, y)
+    model = DeepPolyNetwork(n_layers=2).fit(x, y)
 
     with pytest.raises(ValueError, match="features"):
         model.predict(x[:, :2])
@@ -326,16 +350,16 @@ def test_network_rejects_unsupported_dtype(dtype: Any) -> None:
     x, y = make_data(n_samples=20)
 
     with pytest.raises(ValueError, match="dtype"):
-        PolynomialNetwork(dtype=dtype).fit(x, y)
+        DeepPolyNetwork(dtype=dtype).fit(x, y)
 
 
 def test_network_rejects_complex_data_without_discarding_imaginary_part() -> None:
     x, y = make_data(n_samples=20)
 
     with pytest.raises(ValueError, match="Complex"):
-        PolynomialNetwork().fit(x.astype(np.complex128) + 1j, y)
+        DeepPolyNetwork().fit(x.astype(np.complex128) + 1j, y)
     with pytest.raises(ValueError, match="Complex"):
-        PolynomialNetwork().fit(x, y.astype(np.complex128) + 1j)
+        DeepPolyNetwork().fit(x, y.astype(np.complex128) + 1j)
 
 
 def test_network_dataframe_feature_names_and_input_immutability() -> None:
@@ -346,7 +370,7 @@ def test_network_dataframe_feature_names_and_input_immutability() -> None:
     y_series = pd.Series(y, index=index)
     original_x = x_df.copy(deep=True)
     original_y = y_series.copy(deep=True)
-    model = PolynomialNetwork(n_layers=2, degree=2).fit(x_df, y_series)
+    model = DeepPolyNetwork(n_layers=2, degree=2).fit(x_df, y_series)
 
     np.testing.assert_array_equal(model.feature_names_in_, np.asarray(x_df.columns, dtype=str))
     assert np.isfinite(model.predict(x_df)).all()
@@ -366,7 +390,7 @@ def test_network_is_stable_for_large_finite_features() -> None:
     x = rng.normal(size=(70, 3)) * magnitude
     scaled = x / magnitude
     y = 0.4 + 1.2 * scaled[:, 0] - 0.7 * scaled[:, 1] + 0.08 * scaled[:, 0] ** 2
-    model = PolynomialNetwork(n_layers=4, degree=3, alpha_ridge=1e-5)
+    model = DeepPolyNetwork(n_layers=4, degree=3, alpha_ridge=1e-5)
 
     with np.errstate(over="raise", invalid="raise", divide="raise"):
         model.fit(x, y)
@@ -383,7 +407,7 @@ def test_network_is_stable_for_large_finite_targets(scale_y: bool) -> None:
     rng = np.random.default_rng(45)
     x = rng.normal(size=(70, 3))
     y = 1e200 * (1.0 + 0.2 * x[:, 0] - 0.05 * x[:, 1])
-    model = PolynomialNetwork(
+    model = DeepPolyNetwork(
         n_layers=2,
         degree=2,
         scale_y=scale_y,
@@ -399,7 +423,7 @@ def test_network_is_stable_for_large_finite_targets(scale_y: bool) -> None:
 def test_network_raises_on_numerically_unsafe_extrapolation() -> None:
     x = np.linspace(-1.0, 1.0, 40).reshape(-1, 1)
     y = x[:, 0] + 0.2 * x[:, 0] ** 2
-    model = PolynomialNetwork(n_layers=3, degree=3).fit(x, y)
+    model = DeepPolyNetwork(n_layers=3, degree=3).fit(x, y)
     extreme_x = np.full((2, 1), np.finfo(np.float64).max)
 
     with pytest.raises(FloatingPointError, match="Overflow|non-finite|Non-finite"):
@@ -417,7 +441,7 @@ def test_network_cv_matches_manual_greedy_prefix_cross_validation() -> None:
         "scale": True,
         "normalize_latent": True,
     }
-    model = PolynomialNetworkCV(
+    model = DeepPolyNetworkCV(
         n_layers=n_layers,
         max_degree=max_degree,
         cv=n_splits,
@@ -465,7 +489,7 @@ def test_network_cv_matches_manual_greedy_prefix_cross_validation() -> None:
     )
     assert model.best_score_ == pytest.approx(expected_layer_best_scores[-1])
     assert model.is_fitted_ is True
-    assert isinstance(model.estimator_, PolynomialNetwork)
+    assert isinstance(model.estimator_, DeepPolyNetwork)
     assert tuple(model.estimator_.degree) == expected_degrees
     assert tuple(model.estimator_.degrees_) == expected_degrees
     assert len(model.estimator_.layers_) == model.n_layers
@@ -486,21 +510,21 @@ def test_network_cv_rejects_invalid_search_parameters(
     x, y = make_data(n_samples=20)
 
     with pytest.raises((TypeError, ValueError), match=message):
-        PolynomialNetworkCV(n_layers=1, max_degree=2, cv=2, **parameters).fit(x, y)
+        DeepPolyNetworkCV(n_layers=1, max_degree=2, cv=2, **parameters).fit(x, y)
 
 
 def test_network_cv_rejects_more_folds_than_samples() -> None:
     x, y = make_data(n_samples=5)
 
     with pytest.raises(ValueError, match="cv|splits|samples"):
-        PolynomialNetworkCV(n_layers=1, max_degree=1, cv=6).fit(x, y)
+        DeepPolyNetworkCV(n_layers=1, max_degree=1, cv=6).fit(x, y)
 
 
 def test_network_cv_rejects_single_sample_r2_folds() -> None:
     x, y = make_data(n_samples=5)
 
     with pytest.raises(ValueError, match="at least 2 validation samples"):
-        PolynomialNetworkCV(n_layers=1, max_degree=1, cv=5, scoring="r2").fit(x, y)
+        DeepPolyNetworkCV(n_layers=1, max_degree=1, cv=5, scoring="r2").fit(x, y)
 
 
 def test_network_cv_shuffle_is_reproducible_with_random_state() -> None:
@@ -514,8 +538,8 @@ def test_network_cv_shuffle_is_reproducible_with_random_state() -> None:
         "alpha_ridge": 1e-5,
     }
 
-    first = PolynomialNetworkCV(**parameters).fit(x, y)
-    second = PolynomialNetworkCV(**parameters).fit(x, y)
+    first = DeepPolyNetworkCV(**parameters).fit(x, y)
+    second = DeepPolyNetworkCV(**parameters).fit(x, y)
 
     assert first.selected_degrees_ == second.selected_degrees_
     np.testing.assert_allclose(
@@ -548,7 +572,7 @@ def test_network_estimators_are_sklearn_cloneable() -> None:
     from sklearn.base import clone, is_regressor
 
     del sklearn
-    model = PolynomialNetwork(
+    model = DeepPolyNetwork(
         n_layers=2,
         degree=(1, 3),
         regularization="none",
@@ -570,7 +594,7 @@ def test_network_estimators_are_sklearn_cloneable() -> None:
     assert cloned.degree == (1, 3)
     assert is_regressor(cloned)
 
-    cv_model = PolynomialNetworkCV(
+    cv_model = DeepPolyNetworkCV(
         n_layers=2,
         max_degree=3,
         cv=2,
@@ -608,7 +632,7 @@ def test_network_works_in_sklearn_pipeline() -> None:
     pipeline = Pipeline(
         [
             ("standardize", StandardScaler()),
-            ("network", PolynomialNetwork(n_layers=2, degree=2, scale=False)),
+            ("network", DeepPolyNetwork(n_layers=2, degree=2, scale=False)),
         ]
     )
 
@@ -626,7 +650,7 @@ def test_network_works_in_sklearn_grid_search() -> None:
     del sklearn
     x, y = make_data(n_samples=54, seed=71)
     search = GridSearchCV(
-        PolynomialNetwork(alpha_ridge=1e-5),
+        DeepPolyNetwork(alpha_ridge=1e-5),
         param_grid=[
             {"n_layers": [1], "degree": [1, (2,)]},
             {"n_layers": [2], "degree": [2, (1, 2), (2, 1)]},

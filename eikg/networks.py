@@ -204,7 +204,7 @@ class _FoldState:
     current_power_validation: NDArray[np.float64]
 
 
-class PolynomialNetwork(RegressorMixin, BaseEstimator):
+class DeepPolyNetwork(RegressorMixin, BaseEstimator):
     """Greedy deep polynomial network composed of EIKG regression layers.
 
     The first layer receives max-abs-scaled input features. After layer ``l``,
@@ -259,7 +259,7 @@ class PolynomialNetwork(RegressorMixin, BaseEstimator):
         self.check_input = check_input
         self.lstsq_rcond = lstsq_rcond
 
-    def fit(self, x: Any, y: Any) -> PolynomialNetwork:
+    def fit(self, x: Any, y: Any) -> DeepPolyNetwork:
         """Fit all layers sequentially and replace any previous fitted state."""
 
         self._clear_fitted_state()
@@ -440,7 +440,7 @@ class PolynomialNetwork(RegressorMixin, BaseEstimator):
                 delattr(self, attribute)
 
 
-class PolynomialNetworkCV(RegressorMixin, BaseEstimator):
+class DeepPolyNetworkCV(RegressorMixin, BaseEstimator):
     """Select a separate polynomial degree for each network layer.
 
     Selection proceeds greedily from the first layer to the last. Every fold
@@ -486,7 +486,7 @@ class PolynomialNetworkCV(RegressorMixin, BaseEstimator):
         self.check_input = check_input
         self.lstsq_rcond = lstsq_rcond
 
-    def fit(self, x: Any, y: Any) -> PolynomialNetworkCV:
+    def fit(self, x: Any, y: Any) -> DeepPolyNetworkCV:
         """Select each layer degree and refit the resulting network on all data."""
 
         self._clear_fitted_state()
@@ -633,8 +633,8 @@ class PolynomialNetworkCV(RegressorMixin, BaseEstimator):
 
     def _make_estimator(
         self, degree: int | Sequence[int], *, n_layers: int
-    ) -> PolynomialNetwork:
-        return PolynomialNetwork(
+    ) -> DeepPolyNetwork:
+        return DeepPolyNetwork(
             n_layers=n_layers,
             degree=degree,
             regularization=self.regularization,
@@ -828,3 +828,10 @@ class PolynomialNetworkCV(RegressorMixin, BaseEstimator):
         for attribute in fitted_attributes:
             if hasattr(self, attribute):
                 delattr(self, attribute)
+
+
+# Backward-compatible public names. Keep these as direct aliases so existing
+# imports, parameter grids, and serialized references continue to resolve to
+# the same estimator classes without introducing duplicate subclasses.
+PolynomialNetwork = DeepPolyNetwork
+PolynomialNetworkCV = DeepPolyNetworkCV

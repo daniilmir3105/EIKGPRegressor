@@ -6,8 +6,21 @@ The package provides four sklearn-style estimators:
 
 * `EIKGPolynomialRegressor`
 * `EIKGPolynomialRegressorCV`
-* `PolynomialNetwork`
-* `PolynomialNetworkCV`
+* `DeepPolyNetwork`
+* `DeepPolyNetworkCV`
+
+### Network naming and migration
+
+`DeepPolyNetwork` and `DeepPolyNetworkCV` are the canonical public names for new code. The
+former names remain available as backward-compatible aliases, so existing imports continue to
+work without behavioral changes:
+
+```python
+from eikg import PolynomialNetwork, PolynomialNetworkCV
+```
+
+Prefer the `DeepPolyNetwork*` names in new applications, examples, type annotations, and saved
+configuration metadata.
 
 The model uses a compact two-stage representation:
 
@@ -194,9 +207,9 @@ cv_model = EIKGPolynomialRegressorCV(
 )
 ```
 
-## `PolynomialNetwork`
+## `DeepPolyNetwork`
 
-`PolynomialNetwork` is a fixed-width cascade of independently fitted
+`DeepPolyNetwork` is a fixed-width cascade of independently fitted
 `EIKGPolynomialRegressor` layers. Every layer predicts the same target, and every layer after
 the first receives both the preceding layer prediction and one element-wise power of the
 original features.
@@ -237,14 +250,14 @@ multivariate polynomial basis.
 ```python
 import numpy as np
 
-from eikg import PolynomialNetwork
+from eikg import DeepPolyNetwork
 
 rng = np.random.default_rng(42)
 X = rng.uniform(-2.0, 2.0, size=(300, 3))
 y = 1.5 * X[:, 0] + 0.8 * X[:, 1] ** 2 - 0.3 * X[:, 2] ** 3
 y += rng.normal(scale=0.05, size=X.shape[0])
 
-network = PolynomialNetwork(
+network = DeepPolyNetwork(
     n_layers=3,
     degree=(1, 2, 3),
     regularization="ridge",
@@ -289,18 +302,18 @@ Increase depth only when validation data show that the additional feature powers
 generalization. Use `scale_y=True` when target values have a very large magnitude or dynamic
 range.
 
-## `PolynomialNetworkCV`
+## `DeepPolyNetworkCV`
 
-`PolynomialNetworkCV` greedily selects a separate degree for each layer. Starting with layer 1,
+`DeepPolyNetworkCV` greedily selects a separate degree for each layer. Starting with layer 1,
 it evaluates degrees `1` through `max_degree` using `scoring`, retains that layer's best degree,
 builds fold-local inputs for the next layer, and repeats until `n_layers` degrees have been
-selected. The resulting tuple is then used to fit one final `PolynomialNetwork` on all data
+selected. The resulting tuple is then used to fit one final `DeepPolyNetwork` on all data
 supplied to `fit`.
 
 ```python
-from eikg import PolynomialNetworkCV
+from eikg import DeepPolyNetworkCV
 
-cv_network = PolynomialNetworkCV(
+cv_network = DeepPolyNetworkCV(
     n_layers=3,
     max_degree=5,
     cv=5,
@@ -325,7 +338,7 @@ Running `EIKGPolynomialRegressorCV` independently on a later layer would not be 
 the preceding prediction column had first been produced by a model fitted on all rows. Such a
 column already depends on the validation targets before the later layer creates its folds.
 
-`PolynomialNetworkCV` avoids this by maintaining an independent fitted prefix for each fold.
+`DeepPolyNetworkCV` avoids this by maintaining an independent fitted prefix for each fold.
 For a candidate at layer `l`, that fold's previous layers, input scales, and intermediate
 prediction scales were learned only from its training rows. Validation rows are passed only to
 `predict`; no validation target contributes to an input of a later layer.
@@ -341,7 +354,7 @@ prediction scales were learned only from its training rows. Validation rows are 
 | `shuffle`      |                             `bool` |                    `False` | Whether rows are shuffled before folds are formed.                 |
 | `random_state` |                    `int` or `None` |                     `None` | Non-negative reproducible shuffle seed; ignored when `shuffle=False`. |
 
-The remaining layer parameters are the same explicit parameters as on `PolynomialNetwork`,
+The remaining layer parameters are the same explicit parameters as on `DeepPolyNetwork`,
 except that the per-layer degree tuple is selected by CV and `degree` is therefore replaced by
 `max_degree`.
 
@@ -376,10 +389,11 @@ set or nested cross-validation for an unbiased generalization estimate.
 To select depth and degree together, use the ordinary estimator with scikit-learn:
 
 ```python
+from eikg import DeepPolyNetwork
 from sklearn.model_selection import GridSearchCV
 
 search = GridSearchCV(
-    PolynomialNetwork(),
+    DeepPolyNetwork(),
     {"n_layers": [1, 2, 3], "degree": [1, 2, 3]},
     cv=5,
     scoring="neg_mean_squared_error",
@@ -388,8 +402,8 @@ search.fit(X, y)
 ```
 
 When external preprocessing must itself be fitted inside each fold, put that preprocessing and
-`PolynomialNetwork` in one sklearn `Pipeline` and search the complete pipeline. A supervised
-transformer placed before `PolynomialNetworkCV` would otherwise be fitted before the estimator's
+`DeepPolyNetwork` in one sklearn `Pipeline` and search the complete pipeline. A supervised
+transformer placed before `DeepPolyNetworkCV` would otherwise be fitted before the estimator's
 internal folds and could leak target information.
 
 ## Numerical stability of polynomial networks
@@ -443,7 +457,7 @@ For `EIKGPolynomialRegressorCV`, the main fitted attributes are:
 | `cv_scores_`       | Mean cross-validation scores for all tested degrees. |
 | `estimator_`       | Final fitted `EIKGPolynomialRegressor`.              |
 
-For `PolynomialNetwork`, the main fitted attributes are:
+For `DeepPolyNetwork`, the main fitted attributes are:
 
 | Attribute           | Description                                                            |
 | ------------------- | ---------------------------------------------------------------------- |
@@ -461,7 +475,7 @@ For `PolynomialNetwork`, the main fitted attributes are:
 `layer_prediction_scales_` contains `n_layers - 1` values because the final prediction is
 returned directly and is not transformed for another layer.
 
-For `PolynomialNetworkCV`, the main fitted attributes are:
+For `DeepPolyNetworkCV`, the main fitted attributes are:
 
 | Attribute           | Description                                                        |
 | ------------------- | ------------------------------------------------------------------ |
@@ -473,7 +487,7 @@ For `PolynomialNetworkCV`, the main fitted attributes are:
 | `best_score_`       | Legacy diagnostic: best mean score at the final greedy step.       |
 | `cv_scores_`        | Legacy diagnostic: candidate mean scores at the final greedy step. |
 | `cv_fold_scores_`   | Legacy diagnostic: candidate fold scores at the final greedy step. |
-| `estimator_`        | Final `PolynomialNetwork` refitted on all supplied training rows.  |
+| `estimator_`        | Final `DeepPolyNetwork` refitted on all supplied training rows.    |
 | `n_features_in_`    | Number of original input features seen during fitting.             |
 | `n_layers_`         | Validated number of layers in every evaluated network.             |
 | `feature_names_in_` | Original DataFrame column names, when fitting used named columns.  |
@@ -511,10 +525,10 @@ score = model.score(X, y)
 * The model uses one latent linear projection, so its expressiveness is more limited than a full multivariate polynomial model.
 * High polynomial degrees may be numerically unstable without scaling, latent normalization, or regularization.
 * The model is most suitable when the target can be reasonably approximated by a polynomial function of a compact latent representation.
-* `PolynomialNetwork` is a greedily fitted cascade, not a jointly optimized neural network; later layers do not update earlier-layer coefficients.
+* `DeepPolyNetwork` is a greedily fitted cascade, not a jointly optimized neural network; later layers do not update earlier-layer coefficients.
 * For per-layer latent degrees `d_l`, an upper bound on the effective algebraic degree follows `e_1 = d_1` and `e_l = d_l * max(e_(l-1), l)`. Although explicit width stays at `m + 1`, effective degree and sensitivity can therefore grow rapidly.
 * Max-absolute scaling bounds training powers but cannot guarantee safe extrapolation beyond the observed feature range.
-* `PolynomialNetworkCV` uses greedy layer-wise selection and does not guarantee the globally best degree tuple. Exhaustive selection would evaluate up to `max_degree ** n_layers` configurations.
+* `DeepPolyNetworkCV` uses greedy layer-wise selection and does not guarantee the globally best degree tuple. Exhaustive selection would evaluate up to `max_degree ** n_layers` configurations.
 * Cross-validation diagnostics are selection-biased; reserve independent data or use nested cross-validation for performance estimation.
 * Built-in K-fold selection is not a replacement for a time-series, grouped, or otherwise domain-specific validation design.
 
