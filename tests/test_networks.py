@@ -47,6 +47,61 @@ def ordered_degree_values(values: Any, max_degree: int) -> NDArray[np.float64]:
     return np.asarray(values, dtype=float)
 
 
+def manual_greedy_prefix_cv(
+    x: NDArray[np.float64],
+    y: NDArray[np.float64],
+    *,
+    n_layers: int,
+    max_degree: int,
+    n_splits: int,
+    network_parameters: dict[str, Any],
+) -> tuple[
+    tuple[int, ...],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Independently reproduce layer-wise greedy CV through the public estimator API."""
+
+    splits = contiguous_kfold_indices(x.shape[0], n_splits)
+    selected_degrees: list[int] = []
+    layer_scores: list[NDArray[np.float64]] = []
+    layer_fold_scores: list[NDArray[np.float64]] = []
+    layer_best_scores: list[float] = []
+
+    for layer_index in range(n_layers):
+        candidate_fold_scores: list[list[float]] = []
+        for candidate_degree in range(1, max_degree + 1):
+            candidate_degrees = (*selected_degrees, candidate_degree)
+            fold_scores: list[float] = []
+            for train_indices, validation_indices in splits:
+                candidate = PolynomialNetwork(
+                    n_layers=layer_index + 1,
+                    degree=candidate_degrees,
+                    **network_parameters,
+                ).fit(x[train_indices], y[train_indices])
+                prediction = candidate.predict(x[validation_indices])
+                fold_scores.append(
+                    -mean_squared_error(y[validation_indices], prediction)
+                )
+            candidate_fold_scores.append(fold_scores)
+
+        fold_score_array = np.asarray(candidate_fold_scores, dtype=np.float64)
+        mean_scores = np.mean(fold_score_array, axis=1)
+        best_index = int(np.argmax(mean_scores))
+        selected_degrees.append(best_index + 1)
+        layer_scores.append(mean_scores)
+        layer_fold_scores.append(fold_score_array)
+        layer_best_scores.append(float(mean_scores[best_index]))
+
+    return (
+        tuple(selected_degrees),
+        np.asarray(layer_scores),
+        np.asarray(layer_fold_scores),
+        np.asarray(layer_best_scores),
+    )
+
+
 def test_network_constructor_exposes_documented_defaults() -> None:
     model = PolynomialNetwork()
 
@@ -86,6 +141,57 @@ def test_network_rejects_invalid_n_layers(n_layers: Any) -> None:
         PolynomialNetworkCV(n_layers=n_layers, max_degree=1, cv=2).fit(x, y)
 
 
+def test_network_scalar_degree_is_broadcast_to_all_layers() -> None:
+    x, y = make_data(n_samples=40)
+    model = PolynomialNetwork(n_layers=3, degree=2).fit(x, y)
+
+    assert tuple(model.degrees_) == (2, 2, 2)
+    assert tuple(layer.degree_ for layer in model.layers_) == model.degrees_
+
+
+def test_network_accepts_one_degree_per_layer() -> None:
+    x, y = make_data(n_samples=50)
+    degrees = (1, 3, 2)
+    model = PolynomialNetwork(n_layers=3, degree=degrees).fit(x, y)
+
+    assert model.degree == degrees
+    assert tuple(model.degrees_) == degrees
+    assert model.degree_ is None
+    assert tuple(layer.degree_ for layer in model.layers_) == degrees
+    prediction = model.predict(x)
+    assert prediction.shape == (x.shape[0],)
+    assert np.isfinite(prediction).all()
+
+
+def test_network_reports_common_legacy_degree_for_a_uniform_sequence() -> None:
+    x, y = make_data(n_samples=32)
+    model = PolynomialNetwork(n_layers=3, degree=(2, 2, 2)).fit(x, y)
+
+    assert model.degrees_ == (2, 2, 2)
+    assert model.degree_ == 2
+
+
+@pytest.mark.parametrize(
+    "degree",
+    [
+        (),
+        (1, 2),
+        (1, 2, 3, 4),
+        (1, 0, 2),
+        (1, -1, 2),
+        (1, True, 2),
+        (1, 2.5, 2),
+        (1, "2", 2),
+        "123",
+    ],
+)
+def test_network_rejects_invalid_degree_sequences(degree: Any) -> None:
+    x, y = make_data(n_samples=20)
+
+    with pytest.raises((TypeError, ValueError), match="degree"):
+        PolynomialNetwork(n_layers=3, degree=degree).fit(x, y)
+
+
 @pytest.mark.parametrize("n_layers", [1, 3])
 def test_network_fit_predict_and_fitted_state(n_layers: int) -> None:
     x, y = make_data()
@@ -100,6 +206,8 @@ def test_network_fit_predict_and_fitted_state(n_layers: int) -> None:
     assert len(model.layers_) == n_layers
     assert all(isinstance(layer, EIKGPolynomialRegressor) for layer in model.layers_)
     assert all(layer.is_fitted_ for layer in model.layers_)
+    assert tuple(model.degrees_) == (3,) * n_layers
+    assert tuple(layer.degree_ for layer in model.layers_) == model.degrees_
     assert model.layer_input_sizes_ == [x.shape[1]] + [x.shape[1] + 1] * (n_layers - 1)
     assert len(model.layer_prediction_scales_) == max(0, n_layers - 1)
     assert prediction.shape == (x.shape[0],)
@@ -117,7 +225,10 @@ def test_network_fit_predict_and_fitted_state(n_layers: int) -> None:
 
 def test_network_prediction_follows_fixed_width_layer_architecture() -> None:
     x, y = make_data(n_samples=60)
-    model = PolynomialNetwork(n_layers=4, degree=2, alpha_ridge=1e-6).fit(x, y)
+    degrees = (1, 3, 2, 1)
+    model = PolynomialNetwork(n_layers=4, degree=degrees, alpha_ridge=1e-6).fit(x, y)
+
+    assert tuple(layer.degree_ for layer in model.layers_) == degrees
 
     scaled_x = x / np.asarray(model.base_scale_)
     expected = model.layers_[0].predict(scaled_x)
@@ -295,49 +406,68 @@ def test_network_raises_on_numerically_unsafe_extrapolation() -> None:
         model.predict(extreme_x)
 
 
-def test_network_cv_matches_manual_end_to_end_cross_validation() -> None:
+def test_network_cv_matches_manual_greedy_prefix_cross_validation() -> None:
     x, y = make_data(n_samples=42, seed=51)
     max_degree = 2
     n_splits = 3
-    common_parameters = {
-        "n_layers": 2,
+    n_layers = 3
+    network_parameters = {
         "regularization": "ridge",
         "alpha_ridge": 1e-5,
         "scale": True,
         "normalize_latent": True,
     }
     model = PolynomialNetworkCV(
+        n_layers=n_layers,
         max_degree=max_degree,
         cv=n_splits,
         shuffle=False,
         scoring="neg_mean_squared_error",
-        **common_parameters,
+        **network_parameters,
     ).fit(x, y)
 
-    expected_fold_scores: list[list[float]] = []
-    for degree in range(1, max_degree + 1):
-        degree_scores: list[float] = []
-        for train_indices, test_indices in contiguous_kfold_indices(x.shape[0], n_splits):
-            fold_model = PolynomialNetwork(degree=degree, **common_parameters).fit(
-                x[train_indices], y[train_indices]
-            )
-            fold_prediction = fold_model.predict(x[test_indices])
-            degree_scores.append(-mean_squared_error(y[test_indices], fold_prediction))
-        expected_fold_scores.append(degree_scores)
+    (
+        expected_degrees,
+        expected_layer_scores,
+        expected_layer_fold_scores,
+        expected_layer_best_scores,
+    ) = manual_greedy_prefix_cv(
+        x,
+        y,
+        n_layers=n_layers,
+        max_degree=max_degree,
+        n_splits=n_splits,
+        network_parameters=network_parameters,
+    )
 
-    fold_scores = ordered_degree_values(model.cv_fold_scores_, max_degree)
-    scores = ordered_degree_values(model.cv_scores_, max_degree)
-    expected_fold_scores_array = np.asarray(expected_fold_scores)
-    expected_scores = np.mean(expected_fold_scores_array, axis=1)
-    expected_degree = int(np.argmax(expected_scores)) + 1
+    layer_scores = np.asarray(model.layer_cv_scores_, dtype=np.float64)
+    layer_fold_scores = np.asarray(model.layer_cv_fold_scores_, dtype=np.float64)
+    layer_best_scores = np.asarray(model.layer_best_scores_, dtype=np.float64)
+    assert layer_scores.shape == (n_layers, max_degree)
+    assert layer_fold_scores.shape == (n_layers, max_degree, n_splits)
+    assert layer_best_scores.shape == (n_layers,)
+    assert tuple(model.selected_degrees_) == expected_degrees
+    np.testing.assert_allclose(layer_scores, expected_layer_scores, rtol=1e-11, atol=1e-11)
+    np.testing.assert_allclose(
+        layer_fold_scores, expected_layer_fold_scores, rtol=1e-11, atol=1e-11
+    )
+    np.testing.assert_allclose(
+        layer_best_scores, expected_layer_best_scores, rtol=1e-11, atol=1e-11
+    )
 
-    np.testing.assert_allclose(fold_scores, expected_fold_scores_array, rtol=1e-11, atol=1e-11)
-    np.testing.assert_allclose(scores, expected_scores, rtol=1e-11, atol=1e-11)
-    assert model.selected_degree_ == expected_degree
-    assert model.best_score_ == pytest.approx(expected_scores[expected_degree - 1])
+    assert model.selected_degree_ == expected_degrees[-1]
+    np.testing.assert_allclose(
+        ordered_degree_values(model.cv_scores_, max_degree), expected_layer_scores[-1]
+    )
+    np.testing.assert_allclose(
+        ordered_degree_values(model.cv_fold_scores_, max_degree),
+        expected_layer_fold_scores[-1],
+    )
+    assert model.best_score_ == pytest.approx(expected_layer_best_scores[-1])
     assert model.is_fitted_ is True
     assert isinstance(model.estimator_, PolynomialNetwork)
-    assert model.estimator_.degree == model.selected_degree_
+    assert tuple(model.estimator_.degree) == expected_degrees
+    assert tuple(model.estimator_.degrees_) == expected_degrees
     assert len(model.estimator_.layers_) == model.n_layers
     assert np.isfinite(model.predict(x)).all()
 
@@ -387,13 +517,29 @@ def test_network_cv_shuffle_is_reproducible_with_random_state() -> None:
     first = PolynomialNetworkCV(**parameters).fit(x, y)
     second = PolynomialNetworkCV(**parameters).fit(x, y)
 
-    assert first.selected_degree_ == second.selected_degree_
+    assert first.selected_degrees_ == second.selected_degrees_
     np.testing.assert_allclose(
-        ordered_degree_values(first.cv_fold_scores_, 2),
-        ordered_degree_values(second.cv_fold_scores_, 2),
+        np.asarray(first.layer_cv_scores_),
+        np.asarray(second.layer_cv_scores_),
         rtol=0.0,
         atol=0.0,
     )
+    np.testing.assert_allclose(
+        np.asarray(first.layer_cv_fold_scores_),
+        np.asarray(second.layer_cv_fold_scores_),
+        rtol=0.0,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(
+        np.asarray(first.layer_best_scores_),
+        np.asarray(second.layer_best_scores_),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert first.selected_degree_ == first.selected_degrees_[-1]
+    np.testing.assert_allclose(first.cv_scores_, first.layer_cv_scores_[-1])
+    np.testing.assert_allclose(first.cv_fold_scores_, first.layer_cv_fold_scores_[-1])
+    assert first.best_score_ == pytest.approx(first.layer_best_scores_[-1])
     np.testing.assert_allclose(first.predict(x), second.predict(x), rtol=1e-12, atol=1e-12)
 
 
@@ -404,7 +550,7 @@ def test_network_estimators_are_sklearn_cloneable() -> None:
     del sklearn
     model = PolynomialNetwork(
         n_layers=2,
-        degree=3,
+        degree=(1, 3),
         regularization="none",
         alpha_ridge=0.25,
         fit_intercept=False,
@@ -420,6 +566,8 @@ def test_network_estimators_are_sklearn_cloneable() -> None:
 
     assert cloned.get_params(deep=False) == model.get_params(deep=False)
     assert not hasattr(cloned, "layers_")
+    assert not hasattr(cloned, "degrees_")
+    assert cloned.degree == (1, 3)
     assert is_regressor(cloned)
 
     cv_model = PolynomialNetworkCV(
@@ -443,6 +591,10 @@ def test_network_estimators_are_sklearn_cloneable() -> None:
 
     assert cloned_cv.get_params(deep=False) == cv_model.get_params(deep=False)
     assert not hasattr(cloned_cv, "estimator_")
+    assert not hasattr(cloned_cv, "selected_degrees_")
+    assert not hasattr(cloned_cv, "layer_cv_scores_")
+    assert not hasattr(cloned_cv, "layer_cv_fold_scores_")
+    assert not hasattr(cloned_cv, "layer_best_scores_")
     assert is_regressor(cloned_cv)
 
 
@@ -475,7 +627,10 @@ def test_network_works_in_sklearn_grid_search() -> None:
     x, y = make_data(n_samples=54, seed=71)
     search = GridSearchCV(
         PolynomialNetwork(alpha_ridge=1e-5),
-        param_grid={"n_layers": [1, 2], "degree": [1, 2]},
+        param_grid=[
+            {"n_layers": [1], "degree": [1, (2,)]},
+            {"n_layers": [2], "degree": [2, (1, 2), (2, 1)]},
+        ],
         cv=2,
         scoring="neg_mean_squared_error",
     )
@@ -485,6 +640,6 @@ def test_network_works_in_sklearn_grid_search() -> None:
 
     assert search.best_estimator_ is not None
     assert search.best_params_["n_layers"] in {1, 2}
-    assert search.best_params_["degree"] in {1, 2}
+    assert search.best_params_["degree"] in {1, (2,), 2, (1, 2), (2, 1)}
     assert prediction.shape == (x.shape[0],)
     assert np.isfinite(prediction).all()

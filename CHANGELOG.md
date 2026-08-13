@@ -12,8 +12,12 @@ The format is based on Keep a Changelog, and the project adheres to Semantic Ver
   `EIKGPolynomialRegressor` layers with an explicit `n_layers` parameter.
 - Train-only max-absolute scaling for original features and intermediate predictions before
   constructing successive layer inputs.
-- `PolynomialNetworkCV` for leakage-safe, end-to-end selection of a common layer degree and a
-  final refit on all supplied training data.
+- Scalar or per-layer degree configurations for `PolynomialNetwork`, with canonical fitted
+  `degrees_` metadata.
+- `PolynomialNetworkCV` for leakage-safe greedy selection of a separate degree at every layer,
+  fold-local prefix construction, and a final refit on all supplied training data.
+- Per-layer CV diagnostics: `selected_degrees_`, `layer_cv_scores_`,
+  `layer_cv_fold_scores_`, and `layer_best_scores_`.
 - Validation and diagnostics for non-finite inputs, unstable powered features, fitted state,
   repeated fitting, and feature-name consistency.
 - Documentation for the network mathematics, API, numerical-stability behavior,
@@ -35,6 +39,9 @@ The format is based on Keep a Changelog, and the project adheres to Semantic Ver
   targets can be processed without overflowing mean or variance calculations.
 - Complex-valued inputs and unsupported numeric dtypes are rejected before lossy conversion;
   scoring validates sample counts and follows the standard constant-target R-squared convention.
+- Legacy network-CV diagnostics (`selected_degree_`, `cv_scores_`, `cv_fold_scores_`, and
+  `best_score_`) remain available and now explicitly describe only the final greedy selection
+  step; complete per-layer results are exposed through the new diagnostics.
 
 ## [0.1.1] - 2026-05-09
 

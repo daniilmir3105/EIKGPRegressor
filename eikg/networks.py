@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Sequence
+from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
 
@@ -16,7 +18,6 @@ from .regressors import (
     RegressorMixin,
 )
 from .validation import (
-    validate_degree,
     validate_floating_dtype,
     validate_positive_integer,
     validate_x,
@@ -37,6 +38,31 @@ def _validate_boolean_parameters(**parameters: Any) -> None:
     for name, value in parameters.items():
         if not isinstance(value, (bool, np.bool_)):
             raise ValueError(f"{name} must be a boolean, got {value!r}.")
+
+
+def _resolve_layer_degrees(degree: Any, *, n_layers: int) -> tuple[int, ...]:
+    """Expand a scalar degree or validate one explicit degree per layer."""
+
+    if isinstance(degree, Integral) and not isinstance(degree, (bool, np.bool_)):
+        validated = validate_positive_integer(degree, name="degree")
+        return (validated,) * n_layers
+    if isinstance(degree, (str, bytes)) or not isinstance(degree, (Sequence, np.ndarray)):
+        raise ValueError(
+            "degree must be a positive integer or a sequence containing one "
+            f"positive integer per layer, got {degree!r}."
+        )
+    if isinstance(degree, np.ndarray) and degree.ndim != 1:
+        raise ValueError("degree array must be one-dimensional.")
+    values = list(degree)
+    if len(values) != n_layers:
+        raise ValueError(
+            f"degree sequence must contain exactly n_layers={n_layers} values, "
+            f"got {len(values)}."
+        )
+    return tuple(
+        validate_positive_integer(value, name=f"degree[{index}]")
+        for index, value in enumerate(values)
+    )
 
 
 def _warn_underflow_loss(
@@ -164,6 +190,20 @@ def _next_power(
     return powered
 
 
+@dataclass
+class _FoldState:
+    """Fold-local inputs used by leakage-safe layer-wise model selection."""
+
+    y_train: NDArray[np.float64]
+    y_validation: NDArray[np.float64]
+    base_train: NDArray[np.float64]
+    base_validation: NDArray[np.float64]
+    current_train: NDArray[np.float64]
+    current_validation: NDArray[np.float64]
+    current_power_train: NDArray[np.float64]
+    current_power_validation: NDArray[np.float64]
+
+
 class PolynomialNetwork(RegressorMixin, BaseEstimator):
     """Greedy deep polynomial network composed of EIKG regression layers.
 
@@ -177,8 +217,11 @@ class PolynomialNetwork(RegressorMixin, BaseEstimator):
     ----------
     n_layers : int, default=3
         Number of sequential polynomial layers. Must be a positive integer.
-    degree : int, default=2
-        Common latent polynomial degree used by every layer.
+    degree : int or sequence of int, default=2
+        A scalar applies one latent polynomial degree to every layer. A sequence
+        supplies one positive degree per layer and must have length ``n_layers``.
+        Tuples are recommended when the estimator will be cloned or tuned with
+        scikit-learn.
     regularization : {"none", "ridge", None}, default="ridge"
         Least-squares regularization used by every layer.
     alpha_ridge : float, default=1e-8
@@ -191,7 +234,7 @@ class PolynomialNetwork(RegressorMixin, BaseEstimator):
     def __init__(
         self,
         n_layers: int = 3,
-        degree: int = 2,
+        degree: int | Sequence[int] = 2,
         regularization: str | None = "ridge",
         alpha_ridge: float = 1e-8,
         fit_intercept: bool = True,
@@ -221,8 +264,7 @@ class PolynomialNetwork(RegressorMixin, BaseEstimator):
 
         self._clear_fitted_state()
         n_layers = validate_positive_integer(self.n_layers, name="n_layers")
-        validate_degree(self.degree)
-        degree = int(self.degree)
+        degrees = _resolve_layer_degrees(self.degree, n_layers=n_layers)
         validate_floating_dtype(self.dtype)
         _validate_boolean_parameters(
             fit_intercept=self.fit_intercept,
@@ -251,7 +293,7 @@ class PolynomialNetwork(RegressorMixin, BaseEstimator):
 
         for layer_index in range(n_layers):
             layer_number = layer_index + 1
-            layer = self._make_layer(degree)
+            layer = self._make_layer(degrees[layer_index])
             layer.fit(current_input, y_arr)
             prediction = np.asarray(layer.predict(current_input), dtype=self.dtype)
             _ensure_finite(prediction, context=f"predicting training layer {layer_number}")
@@ -291,7 +333,8 @@ class PolynomialNetwork(RegressorMixin, BaseEstimator):
         self.layer_input_sizes_ = input_sizes
         self.n_features_in_ = int(x_arr.shape[1])
         self.n_layers_ = n_layers
-        self.degree_ = degree
+        self.degrees_ = degrees
+        self.degree_ = degrees[0] if len(set(degrees)) == 1 else None
         if feature_names is not None:
             self.feature_names_in_ = feature_names.copy()
         self.is_fitted_ = True
@@ -388,6 +431,7 @@ class PolynomialNetwork(RegressorMixin, BaseEstimator):
             "n_features_in_",
             "n_layers_",
             "degree_",
+            "degrees_",
             "feature_names_in_",
             "is_fitted_",
         )
@@ -397,12 +441,13 @@ class PolynomialNetwork(RegressorMixin, BaseEstimator):
 
 
 class PolynomialNetworkCV(RegressorMixin, BaseEstimator):
-    """Select one common layer degree using cross-validation of the full network.
+    """Select a separate polynomial degree for each network layer.
 
-    Each candidate degree is evaluated by fitting a fresh complete
-    :class:`PolynomialNetwork` on every training fold. This is deliberately an
-    end-to-end CV: precomputed predictions from a model fitted on validation
-    targets are never passed into later layers.
+    Selection proceeds greedily from the first layer to the last. Every fold
+    maintains its own fitted prefix, scales, and train/validation representation,
+    so no prediction derived from a validation target enters a later layer.
+    Candidate degrees are compared with ``scoring``; exact ties select the lower
+    degree. This greedy search does not guarantee the globally best degree vector.
     """
 
     def __init__(
@@ -442,7 +487,7 @@ class PolynomialNetworkCV(RegressorMixin, BaseEstimator):
         self.lstsq_rcond = lstsq_rcond
 
     def fit(self, x: Any, y: Any) -> PolynomialNetworkCV:
-        """Select a common degree and refit the winning network on all data."""
+        """Select each layer degree and refit the resulting network on all data."""
 
         self._clear_fitted_state()
         n_layers = validate_positive_integer(self.n_layers, name="n_layers")
@@ -473,28 +518,99 @@ class PolynomialNetworkCV(RegressorMixin, BaseEstimator):
             raise ValueError("scoring='r2' requires at least 2 validation samples in every fold.")
 
         splits = self._make_splits(x_arr, y_arr, cv=cv, random_state=random_state)
-        mean_scores: list[float] = []
-        all_fold_scores: list[list[float]] = []
-        for degree in range(1, max_degree + 1):
-            fold_scores: list[float] = []
-            for train_idx, validation_idx in splits:
-                candidate = self._make_estimator(degree, n_layers=n_layers)
-                candidate.fit(x_arr[train_idx], y_arr[train_idx])
-                prediction = candidate.predict(x_arr[validation_idx])
-                fold_scores.append(self._score_fold(y_arr[validation_idx], prediction))
-            all_fold_scores.append(fold_scores)
-            mean_scores.append(float(np.mean(np.asarray(fold_scores, dtype=np.float64))))
+        fold_states = self._initialize_fold_states(x_arr, y_arr, splits)
+        selected_degrees: list[int] = []
+        layer_mean_scores: list[list[float]] = []
+        layer_fold_scores: list[list[list[float]]] = []
+        layer_best_scores: list[float] = []
 
-        score_array = np.asarray(mean_scores, dtype=np.float64)
-        _ensure_finite(score_array, context="aggregating cross-validation scores")
-        best_index = int(np.argmax(score_array))
-        selected_degree = best_index + 1
-        estimator = self._make_estimator(selected_degree, n_layers=n_layers).fit(x, y)
+        for layer_index in range(n_layers):
+            layer_number = layer_index + 1
+            mean_scores: list[float] = []
+            all_fold_scores: list[list[float]] = []
+            best_index = 0
+            best_mean_score = -np.inf
+            best_train_predictions: list[NDArray[np.float64]] | None = None
+            best_validation_predictions: list[NDArray[np.float64]] | None = None
 
-        self.selected_degree_ = selected_degree
-        self.cv_scores_ = mean_scores
-        self.cv_fold_scores_ = all_fold_scores
-        self.best_score_ = mean_scores[best_index]
+            for degree in range(1, max_degree + 1):
+                fold_scores: list[float] = []
+                candidate_layers: list[EIKGPolynomialRegressor] = []
+                validation_predictions: list[NDArray[np.float64]] = []
+                for state in fold_states:
+                    candidate = self._make_layer(degree)
+                    candidate.fit(state.current_train, state.y_train)
+                    prediction = np.asarray(
+                        candidate.predict(state.current_validation), dtype=self.dtype
+                    )
+                    _ensure_finite(
+                        prediction,
+                        context=(
+                            f"predicting validation data for layer {layer_number}, "
+                            f"degree {degree}"
+                        ),
+                    )
+                    candidate_layers.append(candidate)
+                    validation_predictions.append(prediction)
+                    fold_scores.append(self._score_fold(state.y_validation, prediction))
+
+                all_fold_scores.append(fold_scores)
+                mean_score = float(np.mean(np.asarray(fold_scores, dtype=np.float64)))
+                if not np.isfinite(mean_score):
+                    raise FloatingPointError(
+                        f"Layer {layer_number}, degree {degree} produced a non-finite "
+                        "mean cross-validation score."
+                    )
+                mean_scores.append(mean_score)
+                if mean_score > best_mean_score:
+                    best_index = degree - 1
+                    best_mean_score = mean_score
+                    best_validation_predictions = validation_predictions
+                    if layer_number < n_layers:
+                        best_train_predictions = []
+                        for state, candidate in zip(
+                            fold_states, candidate_layers, strict=True
+                        ):
+                            train_prediction = np.asarray(
+                                candidate.predict(state.current_train), dtype=self.dtype
+                            )
+                            _ensure_finite(
+                                train_prediction,
+                                context=(
+                                    f"predicting training data for layer {layer_number}, "
+                                    f"degree {degree}"
+                                ),
+                            )
+                            best_train_predictions.append(train_prediction)
+
+            selected_degree = best_index + 1
+            selected_degrees.append(selected_degree)
+            layer_mean_scores.append(mean_scores)
+            layer_fold_scores.append(all_fold_scores)
+            layer_best_scores.append(best_mean_score)
+
+            if layer_number < n_layers:
+                if best_train_predictions is None or best_validation_predictions is None:
+                    raise RuntimeError("Cross-validation did not retain the selected predictions.")
+                self._advance_fold_states(
+                    fold_states,
+                    best_train_predictions,
+                    best_validation_predictions,
+                    next_exponent=layer_number + 1,
+                    completed_layer=layer_number,
+                )
+
+        estimator = self._make_estimator(tuple(selected_degrees), n_layers=n_layers).fit(x, y)
+
+        self.selected_degrees_ = tuple(selected_degrees)
+        self.layer_cv_scores_ = layer_mean_scores
+        self.layer_cv_fold_scores_ = layer_fold_scores
+        self.layer_best_scores_ = layer_best_scores
+        # Backward-compatible scalar diagnostics refer to the final output layer.
+        self.selected_degree_ = selected_degrees[-1]
+        self.cv_scores_ = layer_mean_scores[-1].copy()
+        self.cv_fold_scores_ = [scores.copy() for scores in layer_fold_scores[-1]]
+        self.best_score_ = layer_best_scores[-1]
         self.estimator_ = estimator
         self.n_features_in_ = estimator.n_features_in_
         self.n_layers_ = n_layers
@@ -515,7 +631,9 @@ class PolynomialNetworkCV(RegressorMixin, BaseEstimator):
         self._check_is_fitted()
         return self.estimator_.score(x, y)
 
-    def _make_estimator(self, degree: int, *, n_layers: int) -> PolynomialNetwork:
+    def _make_estimator(
+        self, degree: int | Sequence[int], *, n_layers: int
+    ) -> PolynomialNetwork:
         return PolynomialNetwork(
             n_layers=n_layers,
             degree=degree,
@@ -530,6 +648,105 @@ class PolynomialNetworkCV(RegressorMixin, BaseEstimator):
             check_input=self.check_input,
             lstsq_rcond=self.lstsq_rcond,
         )
+
+    def _make_layer(self, degree: int) -> EIKGPolynomialRegressor:
+        return EIKGPolynomialRegressor(
+            degree=degree,
+            regularization=self.regularization,
+            alpha_ridge=self.alpha_ridge,
+            fit_intercept=self.fit_intercept,
+            scale=self.scale,
+            scale_y=self.scale_y,
+            normalize_latent=self.normalize_latent,
+            dtype=self.dtype,
+            copy=self.copy,
+            check_input=self.check_input,
+            lstsq_rcond=self.lstsq_rcond,
+        )
+
+    def _initialize_fold_states(
+        self,
+        x: NDArray[np.float64],
+        y: NDArray[np.float64],
+        splits: list[tuple[NDArray[np.int_], NDArray[np.int_]]],
+    ) -> list[_FoldState]:
+        states: list[_FoldState] = []
+        for train_idx, validation_idx in splits:
+            base_scale, base_train = _scale_columns_by_max_abs(
+                x[train_idx], dtype=self.dtype
+            )
+            base_validation = _apply_column_scales(
+                x[validation_idx], base_scale, dtype=self.dtype
+            )
+            states.append(
+                _FoldState(
+                    y_train=y[train_idx],
+                    y_validation=y[validation_idx],
+                    base_train=base_train,
+                    base_validation=base_validation,
+                    current_train=base_train,
+                    current_validation=base_validation,
+                    current_power_train=base_train,
+                    current_power_validation=base_validation,
+                )
+            )
+        return states
+
+    def _advance_fold_states(
+        self,
+        states: list[_FoldState],
+        train_predictions: list[NDArray[np.float64]],
+        validation_predictions: list[NDArray[np.float64]],
+        *,
+        next_exponent: int,
+        completed_layer: int,
+    ) -> None:
+        for state, train_prediction, validation_prediction in zip(
+            states, train_predictions, validation_predictions, strict=True
+        ):
+            prediction_scale = _prediction_scale(train_prediction)
+            normalized_train = _normalize_prediction(
+                train_prediction,
+                prediction_scale,
+                dtype=self.dtype,
+                layer_number=completed_layer,
+            )
+            normalized_validation = _normalize_prediction(
+                validation_prediction,
+                prediction_scale,
+                dtype=self.dtype,
+                layer_number=completed_layer,
+            )
+            state.current_power_train = _next_power(
+                state.current_power_train,
+                state.base_train,
+                dtype=self.dtype,
+                exponent=next_exponent,
+            )
+            state.current_power_validation = _next_power(
+                state.current_power_validation,
+                state.base_validation,
+                dtype=self.dtype,
+                exponent=next_exponent,
+            )
+            state.current_train = np.asarray(
+                np.column_stack((normalized_train, state.current_power_train)),
+                dtype=self.dtype,
+            )
+            state.current_validation = np.asarray(
+                np.column_stack(
+                    (normalized_validation, state.current_power_validation)
+                ),
+                dtype=self.dtype,
+            )
+            _ensure_finite(
+                state.current_train,
+                context=f"building fold training input for layer {completed_layer + 1}",
+            )
+            _ensure_finite(
+                state.current_validation,
+                context=f"building fold validation input for layer {completed_layer + 1}",
+            )
 
     def _make_splits(
         self,
@@ -594,6 +811,10 @@ class PolynomialNetworkCV(RegressorMixin, BaseEstimator):
 
     def _clear_fitted_state(self) -> None:
         fitted_attributes = (
+            "selected_degrees_",
+            "layer_cv_scores_",
+            "layer_cv_fold_scores_",
+            "layer_best_scores_",
             "selected_degree_",
             "cv_scores_",
             "cv_fold_scores_",

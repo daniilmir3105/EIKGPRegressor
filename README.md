@@ -213,11 +213,16 @@ The layer inputs are then:
 
 ```text
 H_1 = X_scaled
-p_l = EIKGPolynomialRegressor(H_l).predict(H_l)
+p_l = EIKGPolynomialRegressor(degree=d_l).fit(H_l, y).predict(H_l)
 H_l = [p_(l-1) / r_(l-1), X_scaled ** l]   for l = 2, ..., L
 r_l = max_i(abs(p_l[i]))             (zero scales are replaced by 1)
 y_pred = p_L
 ```
+
+Here `d_l` is the latent polynomial degree of layer `l`. It is independent of the explicit
+element-wise feature exponent `l`, which continues to be determined by the layer number. A
+scalar `degree=d` sets `d_l=d` for every layer; a sequence supplies the complete
+`(d_1, ..., d_L)` configuration.
 
 The max-absolute scales are learned only from the fitting data and reused unchanged by
 `predict`. Scaling a power column by a nonzero constant does not change the polynomial model
@@ -241,7 +246,7 @@ y += rng.normal(scale=0.05, size=X.shape[0])
 
 network = PolynomialNetwork(
     n_layers=3,
-    degree=2,
+    degree=(1, 2, 3),
     regularization="ridge",
     alpha_ridge=1e-8,
     scale=True,
@@ -251,6 +256,7 @@ network = PolynomialNetwork(
 network.fit(X, y)
 y_pred = network.predict(X)
 r2 = network.score(X, y)
+print(network.degrees_)  # (1, 2, 3)
 ```
 
 ### Main parameters
@@ -258,7 +264,7 @@ r2 = network.score(X, y)
 | Parameter          |                        Type |      Default | Description                                                                                   |
 | ------------------ | --------------------------: | -----------: | --------------------------------------------------------------------------------------------- |
 | `n_layers`         |                       `int` |          `3` | Number of sequential polynomial layers. Must be a positive integer.                           |
-| `degree`           |                       `int` |          `2` | Latent polynomial degree used by every layer.                                                  |
+| `degree`           | `int` or sequence of `int` |          `2` | A scalar degree used by every layer, or exactly one positive degree per layer.                 |
 | `regularization`   | `"none"`, `"ridge"`, `None` |    `"ridge"` | Least-squares regularization mode used by every layer.                                         |
 | `alpha_ridge`      |                     `float` |       `1e-8` | Ridge strength passed to every layer.                                                          |
 | `fit_intercept`    |                      `bool` |       `True` | Whether each layer fits intercepts.                                                            |
@@ -277,16 +283,19 @@ features.
 ### Practical recommendations
 
 Start with two or three layers, degree 1 or 2, Ridge regularization, and latent normalization.
+A scalar is the simplest baseline. Use a tuple such as `degree=(1, 2, 3)` only when layer-wise
+validation supports the extra flexibility; its length must equal `n_layers`.
 Increase depth only when validation data show that the additional feature powers improve
 generalization. Use `scale_y=True` when target values have a very large magnitude or dynamic
 range.
 
 ## `PolynomialNetworkCV`
 
-`PolynomialNetworkCV` selects one common layer degree from `1` through `max_degree`. For each
-candidate and each fold, it fits a fresh **complete network** on the fold's training rows and
-scores the final-layer prediction on the fold's validation rows. The winning configuration is
-then refitted on all data supplied to `fit`.
+`PolynomialNetworkCV` greedily selects a separate degree for each layer. Starting with layer 1,
+it evaluates degrees `1` through `max_degree` using `scoring`, retains that layer's best degree,
+builds fold-local inputs for the next layer, and repeats until `n_layers` degrees have been
+selected. The resulting tuple is then used to fit one final `PolynomialNetwork` on all data
+supplied to `fit`.
 
 ```python
 from eikg import PolynomialNetworkCV
@@ -305,8 +314,8 @@ cv_network = PolynomialNetworkCV(
 )
 
 cv_network.fit(X, y)
-print(cv_network.selected_degree_)
-print(cv_network.best_score_)
+print(cv_network.selected_degrees_)
+print(cv_network.layer_best_scores_)
 y_pred = cv_network.predict(X)
 ```
 
@@ -316,35 +325,53 @@ Running `EIKGPolynomialRegressorCV` independently on a later layer would not be 
 the preceding prediction column had first been produced by a model fitted on all rows. Such a
 column already depends on the validation targets before the later layer creates its folds.
 
-`PolynomialNetworkCV` avoids this by fitting the complete upstream cascade inside every fold.
-Validation rows are passed only to `predict`; input scaling, intermediate prediction scaling,
-and all polynomial layers are learned from that fold's training rows.
+`PolynomialNetworkCV` avoids this by maintaining an independent fitted prefix for each fold.
+For a candidate at layer `l`, that fold's previous layers, input scales, and intermediate
+prediction scales were learned only from its training rows. Validation rows are passed only to
+`predict`; no validation target contributes to an input of a later layer.
 
 ### Main parameters
 
 | Parameter      |                               Type |                    Default | Description                                                        |
 | -------------- | ---------------------------------: | -------------------------: | ------------------------------------------------------------------ |
 | `n_layers`     |                              `int` |                        `3` | Fixed number of layers in every candidate network.                 |
-| `max_degree`   |                              `int` |                        `6` | Highest common layer degree evaluated, starting from degree 1.     |
+| `max_degree`   |                              `int` |                        `6` | Highest candidate degree evaluated independently at every layer.   |
 | `cv`           |                              `int` |                        `5` | Number of folds. Must be between 2 and the number of samples.       |
 | `scoring`      | `"neg_mean_squared_error"`, `"r2"` | `"neg_mean_squared_error"` | Metric used to select the degree.                                  |
 | `shuffle`      |                             `bool` |                    `False` | Whether rows are shuffled before folds are formed.                 |
 | `random_state` |                    `int` or `None` |                     `None` | Non-negative reproducible shuffle seed; ignored when `shuffle=False`. |
 
 The remaining layer parameters are the same explicit parameters as on `PolynomialNetwork`,
-except that `degree` is selected by CV and is therefore replaced by `max_degree`.
+except that the per-layer degree tuple is selected by CV and `degree` is therefore replaced by
+`max_degree`.
 
-With `K = cv`, `D = max_degree`, and `L = n_layers`, model selection performs approximately
-`K * D * L` polynomial-layer fits, followed by `L` fits for the final network. This can be much
-more expensive than a single `EIKGPolynomialRegressorCV`; begin with modest values of `L` and
-`D`. Setting `shuffle=False` is deterministic but may be unsuitable for data ordered by time or
-another systematic variable.
+With `K = cv`, `D = max_degree`, and `L = n_layers`, greedy selection performs `K * D * L`
+candidate layer fits, followed by `L` fits for the final network. Selected fold models may also
+be used to produce training predictions needed for the next fold-local representation; this
+does not change the number of fitted layer models. The overall model-fit count is therefore
+`K * D * L + L`. Begin with modest values of `L` and `D`. Setting `shuffle=False` is
+deterministic but may be unsuitable for data ordered by time or another systematic variable.
 
 If `n` is the number of rows and `q <= m + 1` is a layer's explicit input width, each dense
 least-squares stage costs roughly `O(n * q^2)` when `n >= q`; the latent polynomial solve adds a
 corresponding term based on the candidate degree. Thin-SVD workspaces are the main memory
 bottleneck. Depth does not widen `q`, but CV repeats these dense solves for every candidate and
-fold.
+fold. Candidate polynomial systems grow with degree, so elapsed time can increase faster than
+the simple model-fit count suggests.
+
+### Greedy selection is not a global search
+
+At layer `l`, the selected degree maximizes that layer's mean fold score given the already
+selected prefix. Earlier degrees are not reconsidered after later layers are added. A candidate
+that scores worse immediately could still produce a representation that helps a future layer,
+so the selected tuple is not guaranteed to maximize the final `L`-layer score over all
+`max_degree ** n_layers` possible tuples.
+
+The layer coefficients are also fitted sequentially against the target: later layers never
+update earlier coefficients. Even an exhaustive search over degree tuples would optimize only
+the hyperparameters, not all network coefficients jointly. `layer_best_scores_` and the legacy
+`best_score_` are model-selection diagnostics and are selection-biased; use an independent test
+set or nested cross-validation for an unbiased generalization estimate.
 
 To select depth and degree together, use the ordinary estimator with scikit-learn:
 
@@ -426,7 +453,8 @@ For `PolynomialNetwork`, the main fitted attributes are:
 | `layer_input_sizes_` | Number of columns received by each fitted layer.                       |
 | `n_features_in_`    | Number of original input features seen during fitting.                 |
 | `n_layers_`         | Validated number of fitted layers.                                     |
-| `degree_`           | Validated common latent polynomial degree.                             |
+| `degrees_`          | Canonical tuple containing the fitted degree of every layer.            |
+| `degree_`           | Common degree when all values in `degrees_` match; otherwise `None`.    |
 | `feature_names_in_` | Original DataFrame column names, when fitting used named columns.      |
 | `is_fitted_`        | Whether the complete cascade was fitted successfully.                  |
 
@@ -437,15 +465,34 @@ For `PolynomialNetworkCV`, the main fitted attributes are:
 
 | Attribute           | Description                                                        |
 | ------------------- | ------------------------------------------------------------------ |
-| `selected_degree_`  | Common layer degree selected by whole-network cross-validation.    |
-| `best_score_`       | Best mean cross-validation score among the candidate degrees.      |
-| `cv_scores_`        | Mean scores for candidate degrees 1 through `max_degree`.          |
-| `cv_fold_scores_`   | Per-fold scores retained for every candidate degree.               |
+| `selected_degrees_` | Canonical tuple of greedily selected degrees, one per layer.        |
+| `layer_cv_scores_`  | Mean candidate scores for every layer and degree.                   |
+| `layer_cv_fold_scores_` | Per-fold candidate scores for every layer and degree.          |
+| `layer_best_scores_` | Best mean candidate score reached at each greedy layer step.       |
+| `selected_degree_`  | Legacy diagnostic: selected degree at the final greedy step.       |
+| `best_score_`       | Legacy diagnostic: best mean score at the final greedy step.       |
+| `cv_scores_`        | Legacy diagnostic: candidate mean scores at the final greedy step. |
+| `cv_fold_scores_`   | Legacy diagnostic: candidate fold scores at the final greedy step. |
 | `estimator_`        | Final `PolynomialNetwork` refitted on all supplied training rows.  |
 | `n_features_in_`    | Number of original input features seen during fitting.             |
 | `n_layers_`         | Validated number of layers in every evaluated network.             |
 | `feature_names_in_` | Original DataFrame column names, when fitting used named columns.  |
 | `is_fitted_`        | Whether selection and the final refit completed successfully.      |
+
+The nested diagnostics use layer order first: `layer_cv_scores_[l][d - 1]` is the mean score
+for degree `d` at zero-based layer index `l`, while
+`layer_cv_fold_scores_[l][d - 1]` contains its fold scores. For compatibility, the legacy
+attributes are aliases of the final greedy step:
+
+```text
+selected_degree_ = selected_degrees_[-1]
+cv_scores_ = layer_cv_scores_[-1]
+cv_fold_scores_ = layer_cv_fold_scores_[-1]
+best_score_ = layer_best_scores_[-1]
+```
+
+They do not summarize the earlier decisions and must not be interpreted as an unbiased score
+for the final full-data estimator.
 
 ## Minimal API
 
@@ -465,9 +512,10 @@ score = model.score(X, y)
 * High polynomial degrees may be numerically unstable without scaling, latent normalization, or regularization.
 * The model is most suitable when the target can be reasonably approximated by a polynomial function of a compact latent representation.
 * `PolynomialNetwork` is a greedily fitted cascade, not a jointly optimized neural network; later layers do not update earlier-layer coefficients.
-* Although the explicit network width stays at `m + 1`, the effective degree and sensitivity of the composed prediction can grow rapidly with both `degree` and `n_layers`.
+* For per-layer latent degrees `d_l`, an upper bound on the effective algebraic degree follows `e_1 = d_1` and `e_l = d_l * max(e_(l-1), l)`. Although explicit width stays at `m + 1`, effective degree and sensitivity can therefore grow rapidly.
 * Max-absolute scaling bounds training powers but cannot guarantee safe extrapolation beyond the observed feature range.
-* `PolynomialNetworkCV` selects one common degree for all layers. Searching an independent degree for every layer would require a much larger configuration space.
+* `PolynomialNetworkCV` uses greedy layer-wise selection and does not guarantee the globally best degree tuple. Exhaustive selection would evaluate up to `max_degree ** n_layers` configurations.
+* Cross-validation diagnostics are selection-biased; reserve independent data or use nested cross-validation for performance estimation.
 * Built-in K-fold selection is not a replacement for a time-series, grouped, or otherwise domain-specific validation design.
 
 ## Development checks
