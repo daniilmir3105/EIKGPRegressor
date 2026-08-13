@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from numbers import Integral
 from typing import Any
 
 import numpy as np
@@ -14,7 +15,14 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 def _as_numpy(x: Any, dtype: type[np.floating], copy: bool) -> NDArray[np.float64]:
-    arr = np.asarray(x, dtype=dtype)
+    raw = np.asarray(x)
+    if np.iscomplexobj(raw):
+        raise ValueError("Complex-valued data are not supported.")
+    try:
+        with np.errstate(over="raise", invalid="raise"):
+            arr = np.asarray(x, dtype=dtype)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"Input data cannot be converted safely to dtype {dtype!r}.") from exc
     if copy:
         arr = arr.copy()
     return arr
@@ -70,11 +78,34 @@ def validate_y(
 
 def validate_xy_lengths(x: NDArray[np.float64], y: NDArray[np.float64]) -> None:
     if x.shape[0] != y.shape[0]:
-        raise ValueError(
-            f"X and y row mismatch: X has {x.shape[0]} rows but y has {y.shape[0]}."
-        )
+        raise ValueError(f"X and y row mismatch: X has {x.shape[0]} rows but y has {y.shape[0]}.")
 
 
 def validate_degree(degree: int) -> None:
-    if degree < 1:
-        raise ValueError(f"degree must be >= 1, got {degree}.")
+    validate_positive_integer(degree, name="degree")
+
+
+def validate_floating_dtype(dtype: Any) -> None:
+    """Require a floating dtype supported by the package's linear algebra paths."""
+
+    try:
+        resolved = np.dtype(dtype)
+    except TypeError as exc:
+        raise ValueError(f"dtype must be numpy.float32 or numpy.float64, got {dtype!r}.") from exc
+    if resolved.type not in {np.float32, np.float64}:
+        raise ValueError(f"dtype must be numpy.float32 or numpy.float64, got {dtype!r}.")
+
+
+def validate_positive_integer(value: Any, *, name: str, minimum: int = 1) -> int:
+    """Validate an integer-valued public estimator parameter.
+
+    ``bool`` is rejected explicitly even though it is a subclass of ``int``.
+    NumPy integer scalars are accepted to match common scientific Python usage.
+    """
+
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be >= {minimum} and an integer, got {value!r}.")
+    result = int(value)
+    if result < minimum:
+        raise ValueError(f"{name} must be >= {minimum} and an integer, got {value!r}.")
+    return result

@@ -55,6 +55,12 @@ def test_nan_raises() -> None:
         model.fit(x, y)
 
 
+def test_complex_data_raises() -> None:
+    x, y = make_data()
+    with pytest.raises(ValueError, match="Complex"):
+        EIKGPolynomialRegressor().fit(x.astype(np.complex128) + 1j, y)
+
+
 def test_multicollinearity_not_crash() -> None:
     rng = np.random.default_rng(10)
     x1 = rng.normal(size=80)
@@ -75,6 +81,27 @@ def test_ridge_path_runs() -> None:
     assert hasattr(model, "beta_")
 
 
+def test_ridge_with_zero_alpha_handles_rank_deficiency() -> None:
+    x, y = make_data()
+    x = np.column_stack((x, x[:, 0], 2.0 * x[:, 0]))
+    model = EIKGPolynomialRegressor(regularization="ridge", alpha_ridge=0.0)
+
+    prediction = model.fit(x, y).predict(x)
+
+    assert np.isfinite(prediction).all()
+
+
+@pytest.mark.parametrize("alpha_ridge", [-1.0, np.inf, np.nan, True, "0.1"])
+def test_ridge_rejects_invalid_alpha(alpha_ridge: object) -> None:
+    x, y = make_data()
+
+    with pytest.raises(ValueError, match="alpha_ridge"):
+        EIKGPolynomialRegressor(
+            regularization="ridge",
+            alpha_ridge=alpha_ridge,  # type: ignore[arg-type]
+        ).fit(x, y)
+
+
 def test_reproducible_results() -> None:
     x, y = make_data()
     m1 = EIKGPolynomialRegressor(degree=3).fit(x, y)
@@ -82,3 +109,36 @@ def test_reproducible_results() -> None:
     p1 = m1.predict(x)
     p2 = m2.predict(x)
     np.testing.assert_allclose(p1, p2, rtol=1e-10, atol=1e-10)
+
+
+def test_failed_refit_does_not_leave_mixed_fitted_state() -> None:
+    x, y = make_data()
+    model = EIKGPolynomialRegressor(regularization="ridge").fit(x, y)
+    model.alpha_ridge = -1.0
+
+    with pytest.raises(ValueError, match="alpha_ridge"):
+        model.fit(10.0 * x, y)
+
+    assert not getattr(model, "is_fitted_", False)
+    with pytest.raises(RuntimeError, match="not fitted"):
+        model.predict(x)
+
+
+def test_refit_without_dataframe_drops_stale_feature_names() -> None:
+    pd = pytest.importorskip("pandas")
+    x, y = make_data()
+    x_df = pd.DataFrame(x, columns=["a", "b", "c"])
+    model = EIKGPolynomialRegressor().fit(x_df, y)
+    assert hasattr(model, "feature_names_in_")
+
+    model.fit(x, y)
+
+    assert not hasattr(model, "feature_names_in_")
+
+
+def test_score_rejects_target_length_mismatch() -> None:
+    x, y = make_data()
+    model = EIKGPolynomialRegressor().fit(x, y)
+
+    with pytest.raises(ValueError, match="row mismatch"):
+        model.score(x, np.ones(1))

@@ -1,12 +1,14 @@
 import numpy as np
 import pytest
 
+from eikg.metrics import r2_score
 from eikg.validation import validate_degree, validate_x, validate_xy_lengths, validate_y
 
 
-def test_validate_degree_raises_for_invalid() -> None:
+@pytest.mark.parametrize("degree", [0, -1, 1.5, True, "2"])
+def test_validate_degree_raises_for_invalid(degree: object) -> None:
     with pytest.raises(ValueError, match="degree must be >="):
-        validate_degree(0)
+        validate_degree(degree)  # type: ignore[arg-type]
 
 
 def test_validate_xy_length_mismatch() -> None:
@@ -27,3 +29,10 @@ def test_validate_y_multicolumn_df_raises() -> None:
     y = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
     with pytest.raises(ValueError, match="exactly one column"):
         validate_y(y)
+
+
+def test_r2_constant_target_matches_sklearn_convention() -> None:
+    y = np.full(5, 3.0)
+
+    assert r2_score(y, y.copy()) == 1.0
+    assert r2_score(y, np.zeros_like(y)) == 0.0

@@ -2,10 +2,12 @@
 
 `EIKGPolynomial` is a lightweight Python package for regression models based on the **elementary image of the Kolmogorov-Gabor polynomial**.
 
-The package currently provides two sklearn-style estimators:
+The package provides four sklearn-style estimators:
 
 * `EIKGPolynomialRegressor`
 * `EIKGPolynomialRegressorCV`
+* `PolynomialNetwork`
+* `PolynomialNetworkCV`
 
 The model uses a compact two-stage representation:
 
@@ -117,7 +119,7 @@ from eikg import EIKGPolynomialRegressor
 | `scale`            |                      `bool` |       `True` | Whether to standardize input features `X` before fitting.                                     |
 | `scale_y`          |                      `bool` |      `False` | Whether to standardize target values `y` during fitting and invert scaling during prediction. |
 | `normalize_latent` |                      `bool` |       `True` | Whether to normalize the latent variable before building polynomial powers.                   |
-| `dtype`            |         NumPy floating type | `np.float64` | Internal numeric dtype.                                                                       |
+| `dtype`            | `np.float32` or `np.float64` | `np.float64` | Internal numeric dtype.                                                                       |
 | `copy`             |                      `bool` |       `True` | Whether to copy input arrays during validation.                                               |
 | `check_input`      |                      `bool` |       `True` | Whether to check input shapes and finite values.                                              |
 | `lstsq_rcond`      |           `float` or `None` |       `None` | Cutoff parameter passed to the least-squares solver.                                          |
@@ -192,6 +194,203 @@ cv_model = EIKGPolynomialRegressorCV(
 )
 ```
 
+## `PolynomialNetwork`
+
+`PolynomialNetwork` is a fixed-width cascade of independently fitted
+`EIKGPolynomialRegressor` layers. Every layer predicts the same target, and every layer after
+the first receives both the preceding layer prediction and one element-wise power of the
+original features.
+
+For `m` original features and `L = n_layers`, training first computes a train-only max-absolute
+scale for every input column:
+
+```text
+s_j = max_i(abs(X[i, j]))            (zero scales are replaced by 1)
+X_scaled[:, j] = X[:, j] / s_j
+```
+
+The layer inputs are then:
+
+```text
+H_1 = X_scaled
+p_l = EIKGPolynomialRegressor(H_l).predict(H_l)
+H_l = [p_(l-1) / r_(l-1), X_scaled ** l]   for l = 2, ..., L
+r_l = max_i(abs(p_l[i]))             (zero scales are replaced by 1)
+y_pred = p_L
+```
+
+The max-absolute scales are learned only from the fitting data and reused unchanged by
+`predict`. Scaling a power column by a nonzero constant does not change the polynomial model
+class, but it prevents raw feature magnitudes from being raised directly to high powers.
+
+This construction is fixed-width: layer 1 receives `m` columns and every later layer receives
+`m + 1` columns. It therefore avoids the exponential feature-space expansion of a full
+multivariate polynomial basis.
+
+### Usage
+
+```python
+import numpy as np
+
+from eikg import PolynomialNetwork
+
+rng = np.random.default_rng(42)
+X = rng.uniform(-2.0, 2.0, size=(300, 3))
+y = 1.5 * X[:, 0] + 0.8 * X[:, 1] ** 2 - 0.3 * X[:, 2] ** 3
+y += rng.normal(scale=0.05, size=X.shape[0])
+
+network = PolynomialNetwork(
+    n_layers=3,
+    degree=2,
+    regularization="ridge",
+    alpha_ridge=1e-8,
+    scale=True,
+    normalize_latent=True,
+)
+
+network.fit(X, y)
+y_pred = network.predict(X)
+r2 = network.score(X, y)
+```
+
+### Main parameters
+
+| Parameter          |                        Type |      Default | Description                                                                                   |
+| ------------------ | --------------------------: | -----------: | --------------------------------------------------------------------------------------------- |
+| `n_layers`         |                       `int` |          `3` | Number of sequential polynomial layers. Must be a positive integer.                           |
+| `degree`           |                       `int` |          `2` | Latent polynomial degree used by every layer.                                                  |
+| `regularization`   | `"none"`, `"ridge"`, `None` |    `"ridge"` | Least-squares regularization mode used by every layer.                                         |
+| `alpha_ridge`      |                     `float` |       `1e-8` | Ridge strength passed to every layer.                                                          |
+| `fit_intercept`    |                      `bool` |       `True` | Whether each layer fits intercepts.                                                            |
+| `scale`            |                      `bool` |       `True` | Whether each layer standardizes its constructed input matrix.                                  |
+| `scale_y`          |                      `bool` |      `False` | Whether each layer standardizes the target during fitting.                                     |
+| `normalize_latent` |                      `bool` |       `True` | Whether each layer normalizes its latent projection before constructing powers.                |
+| `dtype`            | `np.float32` or `np.float64` | `np.float64` | Internal numeric dtype.                                                                        |
+| `copy`             |                      `bool` |       `True` | Whether input arrays are copied during validation.                                             |
+| `check_input`      |                      `bool` |       `True` | Whether each inner layer performs its standard input checks. The network always rejects non-finite raw or constructed values. |
+| `lstsq_rcond`      |           `float` or `None` |       `None` | Cutoff passed to the least-squares backend in every layer.                                     |
+
+Repeated calls to `fit` replace the complete learned cascade; old layers are not accumulated.
+`n_layers=1` creates exactly one polynomial layer and does not construct any unused powered
+features.
+
+### Practical recommendations
+
+Start with two or three layers, degree 1 or 2, Ridge regularization, and latent normalization.
+Increase depth only when validation data show that the additional feature powers improve
+generalization. Use `scale_y=True` when target values have a very large magnitude or dynamic
+range.
+
+## `PolynomialNetworkCV`
+
+`PolynomialNetworkCV` selects one common layer degree from `1` through `max_degree`. For each
+candidate and each fold, it fits a fresh **complete network** on the fold's training rows and
+scores the final-layer prediction on the fold's validation rows. The winning configuration is
+then refitted on all data supplied to `fit`.
+
+```python
+from eikg import PolynomialNetworkCV
+
+cv_network = PolynomialNetworkCV(
+    n_layers=3,
+    max_degree=5,
+    cv=5,
+    scoring="neg_mean_squared_error",
+    shuffle=True,
+    random_state=42,
+    regularization="ridge",
+    alpha_ridge=1e-8,
+    scale=True,
+    normalize_latent=True,
+)
+
+cv_network.fit(X, y)
+print(cv_network.selected_degree_)
+print(cv_network.best_score_)
+y_pred = cv_network.predict(X)
+```
+
+### Why cross-validation covers the complete network
+
+Running `EIKGPolynomialRegressorCV` independently on a later layer would not be leakage-safe if
+the preceding prediction column had first been produced by a model fitted on all rows. Such a
+column already depends on the validation targets before the later layer creates its folds.
+
+`PolynomialNetworkCV` avoids this by fitting the complete upstream cascade inside every fold.
+Validation rows are passed only to `predict`; input scaling, intermediate prediction scaling,
+and all polynomial layers are learned from that fold's training rows.
+
+### Main parameters
+
+| Parameter      |                               Type |                    Default | Description                                                        |
+| -------------- | ---------------------------------: | -------------------------: | ------------------------------------------------------------------ |
+| `n_layers`     |                              `int` |                        `3` | Fixed number of layers in every candidate network.                 |
+| `max_degree`   |                              `int` |                        `6` | Highest common layer degree evaluated, starting from degree 1.     |
+| `cv`           |                              `int` |                        `5` | Number of folds. Must be between 2 and the number of samples.       |
+| `scoring`      | `"neg_mean_squared_error"`, `"r2"` | `"neg_mean_squared_error"` | Metric used to select the degree.                                  |
+| `shuffle`      |                             `bool` |                    `False` | Whether rows are shuffled before folds are formed.                 |
+| `random_state` |                    `int` or `None` |                     `None` | Non-negative reproducible shuffle seed; ignored when `shuffle=False`. |
+
+The remaining layer parameters are the same explicit parameters as on `PolynomialNetwork`,
+except that `degree` is selected by CV and is therefore replaced by `max_degree`.
+
+With `K = cv`, `D = max_degree`, and `L = n_layers`, model selection performs approximately
+`K * D * L` polynomial-layer fits, followed by `L` fits for the final network. This can be much
+more expensive than a single `EIKGPolynomialRegressorCV`; begin with modest values of `L` and
+`D`. Setting `shuffle=False` is deterministic but may be unsuitable for data ordered by time or
+another systematic variable.
+
+If `n` is the number of rows and `q <= m + 1` is a layer's explicit input width, each dense
+least-squares stage costs roughly `O(n * q^2)` when `n >= q`; the latent polynomial solve adds a
+corresponding term based on the candidate degree. Thin-SVD workspaces are the main memory
+bottleneck. Depth does not widen `q`, but CV repeats these dense solves for every candidate and
+fold.
+
+To select depth and degree together, use the ordinary estimator with scikit-learn:
+
+```python
+from sklearn.model_selection import GridSearchCV
+
+search = GridSearchCV(
+    PolynomialNetwork(),
+    {"n_layers": [1, 2, 3], "degree": [1, 2, 3]},
+    cv=5,
+    scoring="neg_mean_squared_error",
+)
+search.fit(X, y)
+```
+
+When external preprocessing must itself be fitted inside each fold, put that preprocessing and
+`PolynomialNetwork` in one sklearn `Pipeline` and search the complete pipeline. A supervised
+transformer placed before `PolynomialNetworkCV` would otherwise be fitted before the estimator's
+internal folds and could leak target information.
+
+## Numerical stability of polynomial networks
+
+The network applies max-absolute normalization before constructing element-wise feature powers
+and scales every intermediate prediction using a value learned from the corresponding training
+data. It computes powers incrementally and checks constructed matrices and layer predictions for
+non-finite values. NaN and infinite inputs are rejected; they are never silently replaced with
+zeros. If finite nonzero values underflow to zero during scaling or power construction, the
+network emits a `RuntimeWarning` identifying the affected columns.
+
+Prediction uses the scales learned by `fit` and does not clip new observations. Consequently,
+values far outside the fitting range can still overflow after repeated powers or polynomial
+composition. In that case the estimator raises a diagnostic error instead of returning silently
+corrupted predictions. Reducing `n_layers` or `degree`, enabling target scaling, and checking for
+out-of-distribution feature magnitudes are the preferred remedies.
+
+Max-absolute scaling bounds the explicit powered features on the training set, but it does not
+remove all conditioning risks inside a polynomial layer. Keep `scale=True`,
+`normalize_latent=True`, and Ridge regularization for the usual workflow. A high reported
+training score is not a substitute for validation on data that were excluded from all fitting
+and model-selection steps.
+
+Ridge layers apply the regularization filter to a thin SVD rather than forming the normal
+equations `X.T @ X`. This avoids squaring the design matrix condition number, does not allocate a
+dense penalty identity, and remains well-defined for rank-deficient inputs, including
+`alpha_ridge=0`. The Ridge strength must always be finite and non-negative.
+
 ## Fitted attributes
 
 After calling `fit`, the model stores learned parameters and diagnostics:
@@ -217,9 +416,40 @@ For `EIKGPolynomialRegressorCV`, the main fitted attributes are:
 | `cv_scores_`       | Mean cross-validation scores for all tested degrees. |
 | `estimator_`       | Final fitted `EIKGPolynomialRegressor`.              |
 
+For `PolynomialNetwork`, the main fitted attributes are:
+
+| Attribute           | Description                                                            |
+| ------------------- | ---------------------------------------------------------------------- |
+| `layers_`           | Ordered fitted `EIKGPolynomialRegressor` instances.                    |
+| `base_scale_`       | Train-only max-absolute scale for every original input feature.        |
+| `layer_prediction_scales_` | Train-only scales for predictions passed between adjacent layers. |
+| `layer_input_sizes_` | Number of columns received by each fitted layer.                       |
+| `n_features_in_`    | Number of original input features seen during fitting.                 |
+| `n_layers_`         | Validated number of fitted layers.                                     |
+| `degree_`           | Validated common latent polynomial degree.                             |
+| `feature_names_in_` | Original DataFrame column names, when fitting used named columns.      |
+| `is_fitted_`        | Whether the complete cascade was fitted successfully.                  |
+
+`layer_prediction_scales_` contains `n_layers - 1` values because the final prediction is
+returned directly and is not transformed for another layer.
+
+For `PolynomialNetworkCV`, the main fitted attributes are:
+
+| Attribute           | Description                                                        |
+| ------------------- | ------------------------------------------------------------------ |
+| `selected_degree_`  | Common layer degree selected by whole-network cross-validation.    |
+| `best_score_`       | Best mean cross-validation score among the candidate degrees.      |
+| `cv_scores_`        | Mean scores for candidate degrees 1 through `max_degree`.          |
+| `cv_fold_scores_`   | Per-fold scores retained for every candidate degree.               |
+| `estimator_`        | Final `PolynomialNetwork` refitted on all supplied training rows.  |
+| `n_features_in_`    | Number of original input features seen during fitting.             |
+| `n_layers_`         | Validated number of layers in every evaluated network.             |
+| `feature_names_in_` | Original DataFrame column names, when fitting used named columns.  |
+| `is_fitted_`        | Whether selection and the final refit completed successfully.      |
+
 ## Minimal API
 
-Both estimators follow the standard sklearn-style workflow:
+All four estimators follow the standard sklearn-style workflow:
 
 ```python
 model.fit(X, y)
@@ -234,6 +464,11 @@ score = model.score(X, y)
 * The model uses one latent linear projection, so its expressiveness is more limited than a full multivariate polynomial model.
 * High polynomial degrees may be numerically unstable without scaling, latent normalization, or regularization.
 * The model is most suitable when the target can be reasonably approximated by a polynomial function of a compact latent representation.
+* `PolynomialNetwork` is a greedily fitted cascade, not a jointly optimized neural network; later layers do not update earlier-layer coefficients.
+* Although the explicit network width stays at `m + 1`, the effective degree and sensitivity of the composed prediction can grow rapidly with both `degree` and `n_layers`.
+* Max-absolute scaling bounds training powers but cannot guarantee safe extrapolation beyond the observed feature range.
+* `PolynomialNetworkCV` selects one common degree for all layers. Searching an independent degree for every layer would require a much larger configuration space.
+* Built-in K-fold selection is not a replacement for a time-series, grouped, or otherwise domain-specific validation design.
 
 ## Development checks
 

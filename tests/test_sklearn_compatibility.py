@@ -4,6 +4,7 @@ import pytest
 from eikg.regressors import EIKGPolynomialRegressor, EIKGPolynomialRegressorCV
 
 sklearn = pytest.importorskip("sklearn")
+from sklearn.base import clone, is_regressor  # noqa: E402
 from sklearn.model_selection import GridSearchCV  # noqa: E402
 from sklearn.pipeline import Pipeline  # noqa: E402
 from sklearn.preprocessing import StandardScaler  # noqa: E402
@@ -48,3 +49,25 @@ def test_cv_regressor_selects_degree() -> None:
     model = EIKGPolynomialRegressorCV(max_degree=4, cv=3, scoring="neg_mean_squared_error")
     model.fit(x, y)
     assert 1 <= model.selected_degree_ <= 4
+
+
+def test_existing_estimators_have_regressor_tags() -> None:
+    assert is_regressor(EIKGPolynomialRegressor())
+    assert is_regressor(EIKGPolynomialRegressorCV())
+
+
+def test_cv_regressor_clone_preserves_inner_parameters() -> None:
+    model = EIKGPolynomialRegressorCV(
+        max_degree=3,
+        cv=2,
+        regularization="ridge",
+        alpha_ridge=0.25,
+        scale=False,
+    )
+
+    cloned = clone(model)
+
+    assert cloned.get_params(deep=False) == model.get_params(deep=False)
+    assert cloned.regularization == model.regularization
+    assert cloned.alpha_ridge == model.alpha_ridge
+    assert cloned.scale == model.scale

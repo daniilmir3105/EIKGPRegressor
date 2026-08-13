@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from numbers import Real
 from typing import Any
 
 import numpy as np
@@ -9,7 +10,14 @@ from numpy.typing import NDArray
 
 from .metrics import mean_squared_error, r2_score
 from .preprocessing import StandardScalerLite
-from .validation import validate_degree, validate_x, validate_xy_lengths, validate_y
+from .validation import (
+    validate_degree,
+    validate_floating_dtype,
+    validate_positive_integer,
+    validate_x,
+    validate_xy_lengths,
+    validate_y,
+)
 
 try:
     from scipy.linalg import lstsq as scipy_lstsq
@@ -20,6 +28,7 @@ try:
     from sklearn.base import BaseEstimator, RegressorMixin, clone
     from sklearn.model_selection import KFold
 except Exception:  # pragma: no cover - optional dependency
+
     class BaseEstimator:  # type: ignore[no-redef]
         """Fallback BaseEstimator when sklearn is unavailable."""
 
@@ -38,7 +47,24 @@ except Exception:  # pragma: no cover - optional dependency
     KFold = None
 
 
-class EIKGPolynomialRegressor(BaseEstimator, RegressorMixin):
+def _checked_affine_prediction(
+    x: NDArray[np.float64],
+    coefficients: NDArray[np.float64],
+    intercept: float,
+    *,
+    context: str,
+) -> NDArray[np.float64]:
+    try:
+        with np.errstate(over="raise", divide="raise", invalid="raise", under="ignore"):
+            prediction = x @ coefficients + intercept
+    except FloatingPointError as exc:
+        raise FloatingPointError(f"Overflow or invalid values while {context}.") from exc
+    if not np.isfinite(prediction).all():
+        raise FloatingPointError(f"Non-finite values produced while {context}.")
+    return np.asarray(prediction)
+
+
+class EIKGPolynomialRegressor(RegressorMixin, BaseEstimator):
     """Two-stage EIKG regressor with numerically stable least squares.
 
     The model is trained in two stages:
@@ -101,7 +127,16 @@ class EIKGPolynomialRegressor(BaseEstimator, RegressorMixin):
         self.lstsq_rcond = lstsq_rcond
 
     def fit(self, x: Any, y: Any) -> EIKGPolynomialRegressor:
+        self._clear_fitted_state()
+        try:
+            return self._fit(x, y)
+        except Exception:
+            self._clear_fitted_state()
+            raise
+
+    def _fit(self, x: Any, y: Any) -> EIKGPolynomialRegressor:
         validate_degree(self.degree)
+        validate_floating_dtype(self.dtype)
         x_arr, feature_names = validate_x(
             x, dtype=self.dtype, copy=self.copy, check_input=self.check_input
         )
@@ -134,7 +169,12 @@ class EIKGPolynomialRegressor(BaseEstimator, RegressorMixin):
         self.singular_values_ = sing1
         self.condition_number_ = cond1
 
-        z_train = x_model @ self.beta_ + self.intercept_1_
+        z_train = _checked_affine_prediction(
+            x_model,
+            self.beta_,
+            self.intercept_1_,
+            context="computing the training latent projection",
+        )
         phi = self._build_latent_features(z_train, fit=True)
         alpha, intercept2, rank2, sing2, _ = self._solve_least_squares(phi, y_model)
         self.alpha_ = alpha
@@ -151,16 +191,24 @@ class EIKGPolynomialRegressor(BaseEstimator, RegressorMixin):
             x, dtype=self.dtype, copy=self.copy, check_input=self.check_input
         )
         if x_arr.shape[1] != self.n_features_in_:
-            raise ValueError(
-                f"X has {x_arr.shape[1]} features, expected {self.n_features_in_}."
-            )
+            raise ValueError(f"X has {x_arr.shape[1]} features, expected {self.n_features_in_}.")
         if hasattr(self, "feature_names_in_") and feature_names is not None:
             if not np.array_equal(feature_names, self.feature_names_in_):
                 raise ValueError("X columns at predict must match training feature names/order.")
         x_model = self.x_scaler_.transform(x_arr) if self.x_scaler_ is not None else x_arr
-        z = x_model @ self.beta_ + self.intercept_1_
+        z = _checked_affine_prediction(
+            x_model,
+            self.beta_,
+            self.intercept_1_,
+            context="computing the latent projection",
+        )
         phi = self._build_latent_features(z, fit=False)
-        y_pred = phi @ self.alpha_ + self.intercept_2_
+        y_pred = _checked_affine_prediction(
+            phi,
+            self.alpha_,
+            self.intercept_2_,
+            context="computing the polynomial prediction",
+        )
         if self.y_scaler_ is not None:
             y_pred = self.y_scaler_.inverse_transform(y_pred.reshape(-1, 1)).ravel()
         return y_pred
@@ -168,6 +216,10 @@ class EIKGPolynomialRegressor(BaseEstimator, RegressorMixin):
     def score(self, x: Any, y: Any) -> float:
         y_true = validate_y(y, dtype=self.dtype, copy=False, check_input=self.check_input)
         y_pred = self.predict(x)
+        if y_true.shape[0] != y_pred.shape[0]:
+            raise ValueError(
+                f"X and y row mismatch: X has {y_pred.shape[0]} rows but y has {y_true.shape[0]}."
+            )
         return r2_score(y_true, y_pred)
 
     def _build_latent_features(
@@ -175,20 +227,29 @@ class EIKGPolynomialRegressor(BaseEstimator, RegressorMixin):
     ) -> NDArray[np.float64]:
         z = np.asarray(y_hat, dtype=self.dtype)
         if fit and self.normalize_latent:
-            self.latent_mean_ = float(np.mean(z))
-            self.latent_scale_ = float(np.std(z))
-            if self.latent_scale_ == 0.0:
-                self.latent_scale_ = 1.0
+            self.latent_scaler_ = StandardScalerLite().fit(z.reshape(-1, 1))
+            assert self.latent_scaler_.mean_ is not None
+            assert self.latent_scaler_.scale_ is not None
+            self.latent_mean_ = float(self.latent_scaler_.mean_[0])
+            self.latent_scale_ = float(self.latent_scaler_.scale_[0])
         if self.normalize_latent:
-            if not hasattr(self, "latent_mean_") or not hasattr(self, "latent_scale_"):
+            if not hasattr(self, "latent_scaler_"):
                 raise RuntimeError("Latent normalization parameters are missing.")
-            z = (z - self.latent_mean_) / self.latent_scale_
+            z = self.latent_scaler_.transform(z.reshape(-1, 1)).ravel()
         phi = np.empty((z.shape[0], self.degree), dtype=self.dtype)
         cur = z.copy()
         for degree_idx in range(self.degree):
             if degree_idx > 0:
-                cur = cur * z
-            if self.check_input and not np.isfinite(cur).all():
+                try:
+                    with np.errstate(over="raise", invalid="raise", under="ignore"):
+                        cur = cur * z
+                except FloatingPointError as exc:
+                    raise FloatingPointError(
+                        "Overflow/invalid values while building latent polynomial features. "
+                        "Try lower degree, enable latent normalization, or use stronger "
+                        "regularization."
+                    ) from exc
+            if not np.isfinite(cur).all():
                 raise FloatingPointError(
                     "Overflow/invalid values while building latent polynomial features. "
                     "Try lower degree, enable latent normalization, or use stronger regularization."
@@ -201,17 +262,37 @@ class EIKGPolynomialRegressor(BaseEstimator, RegressorMixin):
     ) -> tuple[NDArray[np.float64], float, int, NDArray[np.float64], float]:
         regularization = "none" if self.regularization is None else str(self.regularization).lower()
         if regularization not in {"none", "ridge"}:
-            raise ValueError(f"regularization must be one of None/'none'/'ridge', got {self.regularization}.")
-        if regularization == "ridge" and self.alpha_ridge < 0:
-            raise ValueError("alpha_ridge must be >= 0.")
+            raise ValueError(
+                f"regularization must be one of None/'none'/'ridge', got {self.regularization}."
+            )
+        ridge_alpha = 0.0
+        if regularization == "ridge":
+            if isinstance(self.alpha_ridge, (bool, np.bool_)) or not isinstance(
+                self.alpha_ridge, Real
+            ):
+                raise ValueError("alpha_ridge must be a finite number >= 0.")
+            ridge_alpha = float(self.alpha_ridge)
+            if not np.isfinite(ridge_alpha) or ridge_alpha < 0:
+                raise ValueError("alpha_ridge must be a finite number >= 0.")
+        if self.lstsq_rcond is not None:
+            if isinstance(self.lstsq_rcond, (bool, np.bool_)) or not isinstance(
+                self.lstsq_rcond, Real
+            ):
+                raise ValueError("lstsq_rcond must be None or a finite number >= 0.")
+            if not np.isfinite(self.lstsq_rcond) or self.lstsq_rcond < 0:
+                raise ValueError("lstsq_rcond must be None or a finite number >= 0.")
 
         x_in = np.asarray(x, dtype=self.dtype)
         y_in = np.asarray(y, dtype=self.dtype)
         if self.fit_intercept:
-            x_mean = np.mean(x_in, axis=0)
-            y_mean = float(np.mean(y_in))
-            x_centered = x_in - x_mean
-            y_centered = y_in - y_mean
+            x_centerer = StandardScalerLite(with_std=False).fit(x_in)
+            y_centerer = StandardScalerLite(with_std=False).fit(y_in.reshape(-1, 1))
+            assert x_centerer.mean_ is not None
+            assert y_centerer.mean_ is not None
+            x_mean = x_centerer.mean_
+            y_mean = float(y_centerer.mean_[0])
+            x_centered = x_centerer.transform(x_in)
+            y_centered = y_centerer.transform(y_in.reshape(-1, 1)).ravel()
         else:
             x_mean = np.zeros(x_in.shape[1], dtype=self.dtype)
             y_mean = 0.0
@@ -219,27 +300,64 @@ class EIKGPolynomialRegressor(BaseEstimator, RegressorMixin):
             y_centered = y_in
 
         if regularization == "ridge":
-            gram = x_centered.T @ x_centered
-            rhs = x_centered.T @ y_centered
-            eye = np.eye(gram.shape[0], dtype=self.dtype)
-            coef = np.linalg.solve(gram + self.alpha_ridge * eye, rhs)
-            rank = int(np.linalg.matrix_rank(x_centered))
-            singular_values = np.linalg.svd(x_centered, compute_uv=False)
+            # Apply the Ridge filter to one thin SVD. This avoids normal equations,
+            # a dense p-by-p penalty matrix, and duplicate decompositions.
+            u, singular_values, vt = np.linalg.svd(x_centered, full_matrices=False)
+            singular_values = np.asarray(singular_values, dtype=self.dtype)
+            if singular_values.size:
+                relative_cutoff = (
+                    float(self.lstsq_rcond)
+                    if self.lstsq_rcond is not None
+                    else np.finfo(self.dtype).eps * max(x_centered.shape)
+                )
+                cutoff = relative_cutoff * float(singular_values[0])
+            else:
+                cutoff = 0.0
+            retained = singular_values > cutoff
+            rank = int(np.count_nonzero(retained))
+            factors = np.zeros_like(singular_values)
+            if ridge_alpha > 0.0:
+                positive = singular_values > 0.0
+                with np.errstate(over="ignore", divide="ignore", invalid="raise"):
+                    denominator = (
+                        singular_values[positive] + ridge_alpha / singular_values[positive]
+                    )
+                    factors[positive] = 1.0 / denominator
+            else:
+                factors[retained] = 1.0 / singular_values[retained]
+            try:
+                with np.errstate(over="raise", divide="raise", invalid="raise", under="ignore"):
+                    coef = vt.T @ (factors * (u.T @ y_centered))
+            except FloatingPointError as exc:
+                raise FloatingPointError(
+                    "Ridge solve produced overflow or invalid coefficient values."
+                ) from exc
+            coef = np.asarray(coef, dtype=self.dtype)
         else:
             if scipy_lstsq is not None:
-                coef, _, rank, singular_values = scipy_lstsq(
+                coef, _, rank_result, singular_values = scipy_lstsq(
                     x_centered, y_centered, cond=self.lstsq_rcond
                 )
             else:
-                coef, _, rank, singular_values = np.linalg.lstsq(
+                coef, _, rank_result, singular_values = np.linalg.lstsq(
                     x_centered, y_centered, rcond=self.lstsq_rcond
                 )
+            rank = int(rank_result)
             coef = np.asarray(coef, dtype=self.dtype)
             singular_values = np.asarray(singular_values, dtype=self.dtype)
 
-        intercept = y_mean - float(x_mean @ coef) if self.fit_intercept else 0.0
+        try:
+            with np.errstate(over="raise", divide="raise", invalid="raise", under="ignore"):
+                intercept = y_mean - float(x_mean @ coef) if self.fit_intercept else 0.0
+        except FloatingPointError as exc:
+            raise FloatingPointError(
+                "The fitted intercept overflowed; scale X or y before fitting."
+            ) from exc
+        if not np.isfinite(coef).all() or not np.isfinite(intercept):
+            raise FloatingPointError("Least-squares fitting produced non-finite coefficients.")
         if singular_values.size > 0 and singular_values[-1] > 0:
-            cond = float(singular_values[0] / singular_values[-1])
+            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                cond = float(singular_values[0] / singular_values[-1])
         else:
             cond = float(np.inf)
         return coef, intercept, int(rank), singular_values, cond
@@ -248,8 +366,33 @@ class EIKGPolynomialRegressor(BaseEstimator, RegressorMixin):
         if not getattr(self, "is_fitted_", False):
             raise RuntimeError("Estimator is not fitted. Call fit(X, y) first.")
 
+    def _clear_fitted_state(self) -> None:
+        fitted_attributes = (
+            "n_features_in_",
+            "feature_names_in_",
+            "x_scaler_",
+            "y_scaler_",
+            "beta_",
+            "intercept_1_",
+            "rank_",
+            "singular_values_",
+            "condition_number_",
+            "latent_mean_",
+            "latent_scale_",
+            "latent_scaler_",
+            "alpha_",
+            "intercept_2_",
+            "rank_latent_",
+            "singular_values_latent_",
+            "degree_",
+            "is_fitted_",
+        )
+        for attribute in fitted_attributes:
+            if hasattr(self, attribute):
+                delattr(self, attribute)
 
-class EIKGPolynomialRegressorCV(BaseEstimator, RegressorMixin):
+
+class EIKGPolynomialRegressorCV(RegressorMixin, BaseEstimator):
     """Degree selection wrapper for EIKGPolynomialRegressor."""
 
     def __init__(
@@ -257,39 +400,60 @@ class EIKGPolynomialRegressorCV(BaseEstimator, RegressorMixin):
         max_degree: int = 6,
         scoring: str = "neg_mean_squared_error",
         cv: int = 5,
-        **regressor_kwargs: Any,
+        regularization: str | None = "none",
+        alpha_ridge: float = 1e-8,
+        fit_intercept: bool = True,
+        scale: bool = True,
+        scale_y: bool = False,
+        normalize_latent: bool = True,
+        dtype: type[np.floating] = np.float64,
+        copy: bool = True,
+        check_input: bool = True,
+        lstsq_rcond: float | None = None,
     ) -> None:
         self.max_degree = max_degree
         self.scoring = scoring
         self.cv = cv
-        self.regressor_kwargs = regressor_kwargs
+        self.regularization = regularization
+        self.alpha_ridge = alpha_ridge
+        self.fit_intercept = fit_intercept
+        self.scale = scale
+        self.scale_y = scale_y
+        self.normalize_latent = normalize_latent
+        self.dtype = dtype
+        self.copy = copy
+        self.check_input = check_input
+        self.lstsq_rcond = lstsq_rcond
 
     def fit(self, x: Any, y: Any) -> EIKGPolynomialRegressorCV:
-        if self.max_degree < 1:
-            raise ValueError(f"max_degree must be >= 1, got {self.max_degree}.")
+        self._clear_fitted_state()
+        max_degree = validate_positive_integer(self.max_degree, name="max_degree")
         if self.scoring not in {"neg_mean_squared_error", "r2"}:
             raise ValueError("scoring must be one of {'neg_mean_squared_error', 'r2'}.")
-        x_arr, _ = validate_x(x, dtype=np.float64, copy=True, check_input=True)
-        y_arr = validate_y(y, dtype=np.float64, copy=True, check_input=True)
+        validate_floating_dtype(self.dtype)
+        x_arr, _ = validate_x(x, dtype=self.dtype, copy=self.copy, check_input=self.check_input)
+        y_arr = validate_y(y, dtype=self.dtype, copy=self.copy, check_input=self.check_input)
         validate_xy_lengths(x_arr, y_arr)
-        if self.cv < 2:
-            raise ValueError("cv must be >= 2.")
+        cv = validate_positive_integer(self.cv, name="cv", minimum=2)
+        if cv > x_arr.shape[0]:
+            raise ValueError(f"cv={cv} cannot exceed the number of samples ({x_arr.shape[0]}).")
+        if self.scoring == "r2" and x_arr.shape[0] // cv < 2:
+            raise ValueError("scoring='r2' requires at least 2 validation samples in every fold.")
 
         scores: list[float] = []
-        for degree in range(1, self.max_degree + 1):
+        for degree in range(1, max_degree + 1):
             fold_scores = self._cv_score_degree(x_arr, y_arr, degree)
             scores.append(float(np.mean(fold_scores)))
         best_idx = int(np.argmax(np.asarray(scores)))
-        self.selected_degree_ = best_idx + 1
+        selected_degree = best_idx + 1
+        estimator = self._make_estimator(selected_degree).fit(x, y)
+        self.selected_degree_ = selected_degree
         self.cv_scores_ = scores
         self.best_score_ = scores[best_idx]
-
-        self.estimator_ = EIKGPolynomialRegressor(
-            degree=self.selected_degree_, **self.regressor_kwargs
-        ).fit(x, y)
-        self.n_features_in_ = self.estimator_.n_features_in_
-        if hasattr(self.estimator_, "feature_names_in_"):
-            self.feature_names_in_ = self.estimator_.feature_names_in_
+        self.estimator_ = estimator
+        self.n_features_in_ = estimator.n_features_in_
+        if hasattr(estimator, "feature_names_in_"):
+            self.feature_names_in_ = estimator.feature_names_in_.copy()
         self.is_fitted_ = True
         return self
 
@@ -304,7 +468,7 @@ class EIKGPolynomialRegressorCV(BaseEstimator, RegressorMixin):
     def _cv_score_degree(
         self, x: NDArray[np.float64], y: NDArray[np.float64], degree: int
     ) -> list[float]:
-        model = EIKGPolynomialRegressor(degree=degree, **self.regressor_kwargs)
+        model = self._make_estimator(degree)
         n_samples = x.shape[0]
         if KFold is not None:
             splitter = KFold(n_splits=self.cv, shuffle=False)
@@ -323,9 +487,7 @@ class EIKGPolynomialRegressorCV(BaseEstimator, RegressorMixin):
 
         fold_scores: list[float] = []
         for train_idx, test_idx in indices:
-            cur_model = clone(model) if clone is not None else EIKGPolynomialRegressor(
-                degree=degree, **self.regressor_kwargs
-            )
+            cur_model = clone(model) if clone is not None else self._make_estimator(degree)
             cur_model.fit(x[train_idx], y[train_idx])
             pred = cur_model.predict(x[test_idx])
             if self.scoring == "r2":
@@ -334,6 +496,35 @@ class EIKGPolynomialRegressorCV(BaseEstimator, RegressorMixin):
                 fold_scores.append(-mean_squared_error(y[test_idx], pred))
         return fold_scores
 
+    def _make_estimator(self, degree: int) -> EIKGPolynomialRegressor:
+        return EIKGPolynomialRegressor(
+            degree=degree,
+            regularization=self.regularization,
+            alpha_ridge=self.alpha_ridge,
+            fit_intercept=self.fit_intercept,
+            scale=self.scale,
+            scale_y=self.scale_y,
+            normalize_latent=self.normalize_latent,
+            dtype=self.dtype,
+            copy=self.copy,
+            check_input=self.check_input,
+            lstsq_rcond=self.lstsq_rcond,
+        )
+
     def _check_is_fitted(self) -> None:
         if not getattr(self, "is_fitted_", False):
             raise RuntimeError("Estimator is not fitted. Call fit(X, y) first.")
+
+    def _clear_fitted_state(self) -> None:
+        fitted_attributes = (
+            "selected_degree_",
+            "cv_scores_",
+            "best_score_",
+            "estimator_",
+            "n_features_in_",
+            "feature_names_in_",
+            "is_fitted_",
+        )
+        for attribute in fitted_attributes:
+            if hasattr(self, attribute):
+                delattr(self, attribute)
