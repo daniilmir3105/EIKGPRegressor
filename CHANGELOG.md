@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and the project adheres to Semantic Ver
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-17
+
 ### Added
 
 - `DeepPolyNetwork`, a fixed-width cascade of independently fitted
@@ -18,12 +20,26 @@ The format is based on Keep a Changelog, and the project adheres to Semantic Ver
   `degrees_` metadata.
 - `DeepPolyNetworkCV` for leakage-safe greedy selection of a separate degree at every layer,
   fold-local prefix construction, and a final refit on all supplied training data.
+- `CombinatorialPolynomialNetwork`, a two-level estimator that evaluates bounded feature
+  combinations with `EIKGPolynomialRegressorCV`, ranks them by ascending mean CV MSE, retains
+  Top-K, and fits a final polynomial learner on their post-selection OOF predictions.
+- Configurable `min_combination_size`, `max_combination_size`, and a hard pre-fit
+  `max_candidates` cap to prevent an implicit combinatorial search explosion.
+- Combinatorial-network diagnostics including `ranking_`, `selected_combinations_`,
+  `selected_models_`, `selected_degrees_`, `oof_predictions_`, `final_estimator_`, and
+  `final_degree_`.
 - Per-layer CV diagnostics: `selected_degrees_`, `layer_cv_scores_`,
   `layer_cv_fold_scores_`, and `layer_best_scores_`.
 - Validation and diagnostics for non-finite inputs, unstable powered features, fitted state,
   repeated fitting, and feature-name consistency.
 - Documentation for the network mathematics, API, numerical-stability behavior,
   cross-validation design, computational cost, and known limitations.
+- Documentation for candidate enumeration, mean-CV-MSE ranking, Top-K selection,
+  post-selection OOF semantics, the need for outer CV when estimating the whole combinatorial
+  procedure, and the reason no separate combinatorial CV class is provided.
+- Release automation for Python 3.10-3.14, built-wheel smoke testing, and tokenless PyPI
+  publication through GitHub Actions Trusted Publishing.
+- Source distributions now include the changelog and release guide.
 
 ### Changed
 
@@ -33,6 +49,9 @@ The format is based on Keep a Changelog, and the project adheres to Semantic Ver
 - Added validation requiring `alpha_ridge` to be finite and non-negative.
 - Restored modern scikit-learn regressor tags for the existing estimators and made
   `EIKGPolynomialRegressorCV` expose its layer options as explicit, clone-safe parameters.
+- `EIKGPolynomialRegressorCV` now retains per-degree fold scores and selected-degree OOF
+  predictions so stacking estimators can reuse the same fold evaluations without in-sample
+  first-level predictions.
 - Fitted state is now cleared on refit, preventing stale DataFrame metadata or mixed model/scaler
   state after an unsuccessful repeated fit.
 - Lightweight scaling now raises diagnostic errors for non-finite statistics and transformed

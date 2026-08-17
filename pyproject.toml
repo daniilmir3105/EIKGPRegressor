@@ -1,16 +1,16 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "eikgp-regressor"
-version = "0.1.1"
-description = "Numerically stable EIKG polynomial regressors"
+version = "0.2.0"
+description = "Numerically stable EIKG polynomial regressors and networks"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-  { name = "EIKG Contributors" }
+  { name = "daniilmir3105" }
 ]
 keywords = ["regression", "machine-learning", "scikit-learn", "numerical-analysis"]
 classifiers = [
@@ -19,16 +19,20 @@ classifiers = [
   "Intended Audience :: Developers",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Operating System :: OS Independent",
 ]
 dependencies = ["numpy>=1.24"]
 
 [project.urls]
-Homepage = "https://github.com/your-org/eikgp-regressor"
-Repository = "https://github.com/your-org/eikgp-regressor"
-Issues = "https://github.com/your-org/eikgp-regressor/issues"
+Homepage = "https://github.com/daniilmir3105/EIKGPolynomial"
+Repository = "https://github.com/daniilmir3105/EIKGPolynomial"
+Issues = "https://github.com/daniilmir3105/EIKGPolynomial/issues"
 
 [project.optional-dependencies]
 pandas = ["pandas>=1.5"]
@@ -70,5 +74,3 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
- 
- 

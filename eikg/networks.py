@@ -1,10 +1,12 @@
-"""Deep, fixed-width polynomial networks built from EIKG regressors."""
+"""Polynomial network estimators built from EIKG regressors."""
 
 from __future__ import annotations
 
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import combinations
+from math import comb
 from numbers import Integral
 from typing import Any
 
@@ -15,6 +17,7 @@ from .metrics import mean_squared_error, r2_score
 from .regressors import (
     BaseEstimator,
     EIKGPolynomialRegressor,
+    EIKGPolynomialRegressorCV,
     RegressorMixin,
 )
 from .validation import (
@@ -822,6 +825,370 @@ class DeepPolyNetworkCV(RegressorMixin, BaseEstimator):
             "estimator_",
             "n_features_in_",
             "n_layers_",
+            "feature_names_in_",
+            "is_fitted_",
+        )
+        for attribute in fitted_attributes:
+            if hasattr(self, attribute):
+                delattr(self, attribute)
+
+
+@dataclass(frozen=True)
+class _CandidateRanking:
+    """First-layer candidate diagnostics retained without the fitted model."""
+
+    enumeration_index: int
+    combination: tuple[int, ...]
+    feature_names: tuple[str, ...] | None
+    selected_degree: int
+    cv_mse_fold_scores: tuple[float, ...]
+    cv_mse_mean: float
+    cv_mse_std: float
+
+
+def _stable_nonnegative_std(values: tuple[float, ...]) -> float:
+    """Compute a finite population standard deviation without squaring large values."""
+
+    array = np.asarray(values, dtype=np.float64)
+    scale = float(np.max(array))
+    if scale == 0.0:
+        return 0.0
+    try:
+        with np.errstate(over="raise", divide="raise", invalid="raise", under="ignore"):
+            result = scale * float(np.std(array / scale, ddof=0))
+    except FloatingPointError as exc:
+        raise FloatingPointError("Could not compute a finite CV MSE standard deviation.") from exc
+    if not np.isfinite(result):
+        raise FloatingPointError("Could not compute a finite CV MSE standard deviation.")
+    return result
+
+
+class CombinatorialPolynomialNetwork(RegressorMixin, BaseEstimator):
+    """Two-level polynomial network with CV-ranked feature combinations.
+
+    The first level enumerates feature combinations, fits one
+    :class:`EIKGPolynomialRegressorCV` per combination, and ranks candidates by
+    ascending mean cross-validation MSE. Only the best ``top_k`` candidates are
+    retained. Their out-of-fold predictions form the training matrix for one
+    final :class:`EIKGPolynomialRegressorCV`.
+
+    Every value in ``oof_predictions_`` was produced by a fold model that did
+    not train on that row. Degree selection and global Top-K selection still use
+    scores from all folds, however, so these are post-selection OOF features.
+    Use an outer cross-validation loop around the complete network for an
+    unbiased estimate of the whole model-selection procedure.
+
+    Parameters
+    ----------
+    top_k : int, default=5
+        Number of highest-ranked first-level candidates passed to the final
+        estimator. Must not exceed the number of generated candidates.
+    min_combination_size : int, default=2
+        Smallest feature combination to evaluate. Must be at least two.
+    max_combination_size : int, default=2
+        Largest feature combination to evaluate. Pairwise search is the safe
+        default; larger values must be enabled explicitly.
+    max_candidates : int, default=1000
+        Hard pre-fit limit on the number of generated combinations. If the
+        requested search space exceeds it, ``fit`` raises before any candidate
+        model is trained.
+    max_degree : int, default=6
+        Maximum polynomial degree considered independently for every first-level
+        candidate and for the final estimator.
+    cv : int, default=5
+        Number of contiguous cross-validation folds used by every CV estimator.
+    regularization : {"none", "ridge", None}, default="ridge"
+        Least-squares regularization used throughout the network.
+    alpha_ridge : float, default=1e-8
+        Ridge strength used when ``regularization="ridge"``.
+    fit_intercept, scale, scale_y, normalize_latent, dtype, copy, check_input,
+    lstsq_rcond
+        Passed to every :class:`EIKGPolynomialRegressorCV`.
+
+    Notes
+    -----
+    After fitting, ``ranking_`` contains one dictionary per evaluated candidate
+    with its feature combination, selected degree, fold MSE values, mean/std CV
+    MSE, rank, and Top-K selection flag. Candidate models outside Top-K are not
+    retained.
+    """
+
+    def __init__(
+        self,
+        top_k: int = 5,
+        min_combination_size: int = 2,
+        max_combination_size: int = 2,
+        max_candidates: int = 1000,
+        max_degree: int = 6,
+        cv: int = 5,
+        regularization: str | None = "ridge",
+        alpha_ridge: float = 1e-8,
+        fit_intercept: bool = True,
+        scale: bool = True,
+        scale_y: bool = False,
+        normalize_latent: bool = True,
+        dtype: type[np.floating] = np.float64,
+        copy: bool = True,
+        check_input: bool = True,
+        lstsq_rcond: float | None = None,
+    ) -> None:
+        self.top_k = top_k
+        self.min_combination_size = min_combination_size
+        self.max_combination_size = max_combination_size
+        self.max_candidates = max_candidates
+        self.max_degree = max_degree
+        self.cv = cv
+        self.regularization = regularization
+        self.alpha_ridge = alpha_ridge
+        self.fit_intercept = fit_intercept
+        self.scale = scale
+        self.scale_y = scale_y
+        self.normalize_latent = normalize_latent
+        self.dtype = dtype
+        self.copy = copy
+        self.check_input = check_input
+        self.lstsq_rcond = lstsq_rcond
+
+    def fit(self, x: Any, y: Any) -> CombinatorialPolynomialNetwork:
+        """Fit, rank, select, and stack the combinatorial polynomial candidates."""
+
+        self._clear_fitted_state()
+        try:
+            return self._fit(x, y)
+        except Exception:
+            self._clear_fitted_state()
+            raise
+
+    def _fit(self, x: Any, y: Any) -> CombinatorialPolynomialNetwork:
+        top_k = validate_positive_integer(self.top_k, name="top_k")
+        min_size = validate_positive_integer(
+            self.min_combination_size,
+            name="min_combination_size",
+            minimum=2,
+        )
+        max_size = validate_positive_integer(
+            self.max_combination_size,
+            name="max_combination_size",
+            minimum=2,
+        )
+        max_candidates = validate_positive_integer(self.max_candidates, name="max_candidates")
+        max_degree = validate_positive_integer(self.max_degree, name="max_degree")
+        cv = validate_positive_integer(self.cv, name="cv", minimum=2)
+        if min_size > max_size:
+            raise ValueError(
+                "min_combination_size must be less than or equal to max_combination_size."
+            )
+        validate_floating_dtype(self.dtype)
+        _validate_boolean_parameters(
+            fit_intercept=self.fit_intercept,
+            scale=self.scale,
+            scale_y=self.scale_y,
+            normalize_latent=self.normalize_latent,
+            copy=self.copy,
+            check_input=self.check_input,
+        )
+
+        x_arr, feature_names = validate_x(
+            x, dtype=self.dtype, copy=self.copy, check_input=self.check_input
+        )
+        y_arr = validate_y(y, dtype=self.dtype, copy=self.copy, check_input=self.check_input)
+        validate_xy_lengths(x_arr, y_arr)
+        _ensure_finite(x_arr, context="validating combinatorial network input")
+        _ensure_finite(y_arr, context="validating combinatorial network target")
+
+        n_samples, n_features = x_arr.shape
+        if max_size > n_features:
+            raise ValueError(
+                f"max_combination_size={max_size} cannot exceed the number of "
+                f"features ({n_features})."
+            )
+        if cv > n_samples:
+            raise ValueError(f"cv={cv} cannot exceed the number of samples ({n_samples}).")
+
+        n_candidates = sum(comb(n_features, size) for size in range(min_size, max_size + 1))
+        if n_candidates > max_candidates:
+            estimated_fits = n_candidates * (max_degree * cv + 1)
+            raise ValueError(
+                f"The requested search generates {n_candidates} candidates, exceeding "
+                f"max_candidates={max_candidates} (about {estimated_fits} first-level "
+                "regressor fits). Reduce max_combination_size or explicitly raise "
+                "max_candidates."
+            )
+        if top_k > n_candidates:
+            raise ValueError(
+                f"top_k={top_k} cannot exceed the number of generated candidates "
+                f"({n_candidates})."
+            )
+
+        ranking_records: list[_CandidateRanking] = []
+        retained: list[
+            tuple[_CandidateRanking, EIKGPolynomialRegressorCV]
+        ] = []
+        enumeration_index = 0
+        for size in range(min_size, max_size + 1):
+            for combination in combinations(range(n_features), size):
+                candidate = self._make_cv_estimator(max_degree=max_degree, cv=cv)
+                candidate.fit(x_arr[:, combination], y_arr)
+                degree_index = candidate.selected_degree_ - 1
+                fold_mse_scores = tuple(
+                    float(-score) for score in candidate.cv_fold_scores_[degree_index]
+                )
+                cv_mse_mean = float(-candidate.best_score_)
+                cv_mse_std = _stable_nonnegative_std(fold_mse_scores)
+                if not np.isfinite(cv_mse_mean) or cv_mse_mean < 0.0:
+                    raise FloatingPointError(
+                        f"Candidate {combination} produced an invalid mean CV MSE."
+                    )
+                combination_names = (
+                    None
+                    if feature_names is None
+                    else tuple(str(feature_names[index]) for index in combination)
+                )
+                record = _CandidateRanking(
+                    enumeration_index=enumeration_index,
+                    combination=combination,
+                    feature_names=combination_names,
+                    selected_degree=int(candidate.selected_degree_),
+                    cv_mse_fold_scores=fold_mse_scores,
+                    cv_mse_mean=cv_mse_mean,
+                    cv_mse_std=cv_mse_std,
+                )
+                enumeration_index += 1
+                ranking_records.append(record)
+                retained.append((record, candidate))
+                retained.sort(
+                    key=lambda item: (item[0].cv_mse_mean, item[0].enumeration_index)
+                )
+                if len(retained) > top_k:
+                    retained.pop()
+
+        ranking_records.sort(key=lambda row: (row.cv_mse_mean, row.enumeration_index))
+        retained.sort(key=lambda item: (item[0].cv_mse_mean, item[0].enumeration_index))
+        selected_combinations = tuple(record.combination for record, _ in retained)
+        selected_models = tuple(model for _, model in retained)
+        selected_degrees = tuple(model.selected_degree_ for model in selected_models)
+
+        oof_predictions = np.asarray(
+            np.column_stack([model.oof_predictions_ for model in selected_models]),
+            dtype=self.dtype,
+        )
+        _ensure_finite(oof_predictions, context="building second-level OOF features")
+        final_estimator = self._make_cv_estimator(max_degree=max_degree, cv=cv)
+        final_estimator.fit(oof_predictions, y_arr)
+
+        selected_set = set(selected_combinations)
+        ranking: list[dict[str, object]] = []
+        for rank, record in enumerate(ranking_records, start=1):
+            ranking.append(
+                {
+                    "rank": rank,
+                    "combination": record.combination,
+                    "feature_names": record.feature_names,
+                    "combination_size": len(record.combination),
+                    "selected_degree": record.selected_degree,
+                    "cv_mse_fold_scores": record.cv_mse_fold_scores,
+                    "cv_mse_mean": record.cv_mse_mean,
+                    "cv_mse_std": record.cv_mse_std,
+                    "selected": record.combination in selected_set,
+                }
+            )
+
+        self.n_features_in_ = int(n_features)
+        self.n_candidates_ = n_candidates
+        self.top_k_ = top_k
+        self.ranking_ = ranking
+        self.selected_combinations_ = selected_combinations
+        self.selected_models_ = selected_models
+        self.selected_degrees_ = selected_degrees
+        self.oof_predictions_ = oof_predictions
+        self.final_estimator_ = final_estimator
+        self.final_degree_ = int(final_estimator.selected_degree_)
+        if feature_names is not None:
+            self.feature_names_in_ = feature_names.copy()
+        self.is_fitted_ = True
+        return self
+
+    def predict(self, x: Any) -> NDArray[np.float64]:
+        """Predict using only the retained Top-K candidates and final estimator."""
+
+        self._check_is_fitted()
+        x_arr, feature_names = validate_x(
+            x, dtype=self.dtype, copy=self.copy, check_input=self.check_input
+        )
+        if x_arr.shape[1] != self.n_features_in_:
+            raise ValueError(f"X has {x_arr.shape[1]} features, expected {self.n_features_in_}.")
+        if hasattr(self, "feature_names_in_") and feature_names is not None:
+            if not np.array_equal(feature_names, self.feature_names_in_):
+                raise ValueError("X columns at predict must match training feature names/order.")
+        _ensure_finite(x_arr, context="validating combinatorial prediction input")
+
+        second_level = np.empty((x_arr.shape[0], self.top_k_), dtype=self.dtype)
+        for column, (combination, model) in enumerate(
+            zip(self.selected_combinations_, self.selected_models_)
+        ):
+            prediction = np.asarray(model.predict(x_arr[:, combination]), dtype=self.dtype)
+            _ensure_finite(
+                prediction,
+                context=f"predicting selected combination {combination}",
+            )
+            second_level[:, column] = prediction
+        _ensure_finite(second_level, context="building second-level prediction features")
+        prediction = np.asarray(self.final_estimator_.predict(second_level), dtype=self.dtype)
+        _ensure_finite(prediction, context="predicting the combinatorial network output")
+        return prediction
+
+    def score(self, x: Any, y: Any) -> float:
+        """Return the coefficient of determination, R-squared."""
+
+        y_true = validate_y(y, dtype=self.dtype, copy=False, check_input=self.check_input)
+        _ensure_finite(y_true, context="validating combinatorial score target")
+        y_pred = self.predict(x)
+        if y_true.shape[0] != y_pred.shape[0]:
+            raise ValueError(
+                f"X and y row mismatch: X has {y_pred.shape[0]} rows but y has "
+                f"{y_true.shape[0]}."
+            )
+        with np.errstate(over="raise", divide="raise", invalid="raise", under="ignore"):
+            result = r2_score(y_true, y_pred)
+        if not np.isfinite(result):
+            raise FloatingPointError("R-squared is non-finite for the supplied data.")
+        return result
+
+    def _make_cv_estimator(
+        self, *, max_degree: int, cv: int
+    ) -> EIKGPolynomialRegressorCV:
+        return EIKGPolynomialRegressorCV(
+            max_degree=max_degree,
+            scoring="neg_mean_squared_error",
+            cv=cv,
+            regularization=self.regularization,
+            alpha_ridge=self.alpha_ridge,
+            fit_intercept=self.fit_intercept,
+            scale=self.scale,
+            scale_y=self.scale_y,
+            normalize_latent=self.normalize_latent,
+            dtype=self.dtype,
+            copy=self.copy,
+            check_input=self.check_input,
+            lstsq_rcond=self.lstsq_rcond,
+        )
+
+    def _check_is_fitted(self) -> None:
+        if not getattr(self, "is_fitted_", False):
+            raise RuntimeError("Estimator is not fitted. Call fit(X, y) first.")
+
+    def _clear_fitted_state(self) -> None:
+        fitted_attributes = (
+            "n_features_in_",
+            "n_candidates_",
+            "top_k_",
+            "ranking_",
+            "selected_combinations_",
+            "selected_models_",
+            "selected_degrees_",
+            "oof_predictions_",
+            "final_estimator_",
+            "final_degree_",
             "feature_names_in_",
             "is_fitted_",
         )

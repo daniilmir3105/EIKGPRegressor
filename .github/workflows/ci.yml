@@ -5,13 +5,18 @@ on:
     branches: ["main", "master"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
+    name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,23 +25,60 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
-      - name: Install dependencies
+      - name: Install development dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install --editable ".[dev]"
 
       - name: Lint
-        run: ruff check .
+        run: python -m ruff check .
 
       - name: Type check
-        run: mypy eikg
+        run: python -m mypy eikg
 
       - name: Test
-        run: pytest
+        run: python -m pytest
 
-      - name: Build package
+  package:
+    name: Build and verify distribution
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install packaging tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Build source and wheel distributions
         run: python -m build
 
-      - name: Verify dist metadata
-        run: python -m twine check dist/*
+      - name: Verify distribution metadata
+        run: python -m twine check --strict dist/*
+
+      - name: Install and smoke-test the wheel in a clean environment
+        run: |
+          python -m venv "${RUNNER_TEMP}/eikg-wheel-smoke"
+          "${RUNNER_TEMP}/eikg-wheel-smoke/bin/python" -m pip install --upgrade pip
+          "${RUNNER_TEMP}/eikg-wheel-smoke/bin/python" -m pip install dist/*.whl
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/eikg-wheel-smoke/bin/python" -c "from eikg import CombinatorialPolynomialNetwork, DeepPolyNetwork, DeepPolyNetworkCV, EIKGPolynomialRegressor, EIKGPolynomialRegressorCV, PolynomialNetwork, PolynomialNetworkCV"
+
+      - name: Upload distribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

@@ -64,6 +64,20 @@ def _checked_affine_prediction(
     return np.asarray(prediction)
 
 
+def _stable_finite_mean(values: list[float]) -> float:
+    """Average finite scores without overflowing their intermediate sum."""
+
+    array = np.asarray(values, dtype=np.float64)
+    scale = float(np.max(np.abs(array)))
+    if scale == 0.0:
+        return 0.0
+    with np.errstate(over="raise", divide="raise", invalid="raise", under="ignore"):
+        result = scale * float(np.mean(array / scale))
+    if not np.isfinite(result):
+        raise FloatingPointError("Cross-validation produced a non-finite mean score.")
+    return result
+
+
 class EIKGPolynomialRegressor(RegressorMixin, BaseEstimator):
     """Two-stage EIKG regressor with numerically stable least squares.
 
@@ -393,7 +407,15 @@ class EIKGPolynomialRegressor(RegressorMixin, BaseEstimator):
 
 
 class EIKGPolynomialRegressorCV(RegressorMixin, BaseEstimator):
-    """Degree selection wrapper for EIKGPolynomialRegressor."""
+    """Degree selection wrapper for :class:`EIKGPolynomialRegressor`.
+
+    In addition to mean cross-validation scores, the fitted estimator retains
+    per-fold scores and out-of-fold predictions for the selected degree. Every
+    row in ``oof_predictions_`` is predicted by a fold model that was not fitted
+    on that row. Because the degree is selected using all fold scores, these are
+    post-selection OOF predictions rather than an unbiased estimate of the full
+    tuning procedure.
+    """
 
     def __init__(
         self,
@@ -440,16 +462,33 @@ class EIKGPolynomialRegressorCV(RegressorMixin, BaseEstimator):
         if self.scoring == "r2" and x_arr.shape[0] // cv < 2:
             raise ValueError("scoring='r2' requires at least 2 validation samples in every fold.")
 
+        splits = self._make_splits(x_arr.shape[0], cv=cv)
         scores: list[float] = []
+        all_fold_scores: list[list[float]] = []
+        best_oof_predictions: NDArray[np.float64] | None = None
+        best_idx = 0
         for degree in range(1, max_degree + 1):
-            fold_scores = self._cv_score_degree(x_arr, y_arr, degree)
-            scores.append(float(np.mean(fold_scores)))
-        best_idx = int(np.argmax(np.asarray(scores)))
+            fold_scores, oof_predictions = self._cross_validate_degree(
+                x_arr,
+                y_arr,
+                degree,
+                splits=splits,
+            )
+            mean_score = _stable_finite_mean(fold_scores)
+            scores.append(mean_score)
+            all_fold_scores.append(fold_scores)
+            if best_oof_predictions is None or mean_score > scores[best_idx]:
+                best_idx = degree - 1
+                best_oof_predictions = oof_predictions.copy()
+        if best_oof_predictions is None:  # pragma: no cover - max_degree is positive
+            raise RuntimeError("Cross-validation did not evaluate any polynomial degree.")
         selected_degree = best_idx + 1
         estimator = self._make_estimator(selected_degree).fit(x, y)
         self.selected_degree_ = selected_degree
         self.cv_scores_ = scores
+        self.cv_fold_scores_ = all_fold_scores
         self.best_score_ = scores[best_idx]
+        self.oof_predictions_ = best_oof_predictions
         self.estimator_ = estimator
         self.n_features_in_ = estimator.n_features_in_
         if hasattr(estimator, "feature_names_in_"):
@@ -465,36 +504,64 @@ class EIKGPolynomialRegressorCV(RegressorMixin, BaseEstimator):
         self._check_is_fitted()
         return self.estimator_.score(x, y)
 
-    def _cv_score_degree(
-        self, x: NDArray[np.float64], y: NDArray[np.float64], degree: int
-    ) -> list[float]:
+    def _cross_validate_degree(
+        self,
+        x: NDArray[np.float64],
+        y: NDArray[np.float64],
+        degree: int,
+        *,
+        splits: list[tuple[NDArray[np.int_], NDArray[np.int_]]],
+    ) -> tuple[list[float], NDArray[np.float64]]:
         model = self._make_estimator(degree)
-        n_samples = x.shape[0]
-        if KFold is not None:
-            splitter = KFold(n_splits=self.cv, shuffle=False)
-            indices = splitter.split(x, y)
-        else:
-            fold_sizes = np.full(self.cv, n_samples // self.cv, dtype=int)
-            fold_sizes[: n_samples % self.cv] += 1
-            starts = np.cumsum(np.concatenate(([0], fold_sizes[:-1])))
-            indices = []
-            for start, fold_size in zip(starts, fold_sizes):
-                test_idx = np.arange(start, start + fold_size)
-                train_mask = np.ones(n_samples, dtype=bool)
-                train_mask[test_idx] = False
-                train_idx = np.arange(n_samples)[train_mask]
-                indices.append((train_idx, test_idx))
-
         fold_scores: list[float] = []
-        for train_idx, test_idx in indices:
+        oof_predictions = np.empty(x.shape[0], dtype=self.dtype)
+        assigned = np.zeros(x.shape[0], dtype=bool)
+        for train_idx, test_idx in splits:
+            if np.any(assigned[test_idx]):  # pragma: no cover - guarded by split construction
+                raise RuntimeError("Cross-validation assigned a training row more than once.")
             cur_model = clone(model) if clone is not None else self._make_estimator(degree)
             cur_model.fit(x[train_idx], y[train_idx])
-            pred = cur_model.predict(x[test_idx])
+            pred = np.asarray(cur_model.predict(x[test_idx]), dtype=self.dtype)
+            if not np.isfinite(pred).all():
+                raise FloatingPointError(
+                    f"Degree {degree} produced non-finite out-of-fold predictions."
+                )
+            oof_predictions[test_idx] = pred
+            assigned[test_idx] = True
             if self.scoring == "r2":
-                fold_scores.append(r2_score(y[test_idx], pred))
+                score = r2_score(y[test_idx], pred)
             else:
-                fold_scores.append(-mean_squared_error(y[test_idx], pred))
-        return fold_scores
+                score = -mean_squared_error(y[test_idx], pred)
+            if not np.isfinite(score):
+                raise FloatingPointError(
+                    f"Degree {degree} produced a non-finite cross-validation score."
+                )
+            fold_scores.append(float(score))
+        if not np.all(assigned):  # pragma: no cover - guarded by split construction
+            raise RuntimeError("Cross-validation did not predict every training row exactly once.")
+        return fold_scores, oof_predictions
+
+    def _make_splits(
+        self, n_samples: int, *, cv: int
+    ) -> list[tuple[NDArray[np.int_], NDArray[np.int_]]]:
+        if KFold is not None:
+            splitter = KFold(n_splits=cv, shuffle=False)
+            return [
+                (np.asarray(train_idx), np.asarray(test_idx))
+                for train_idx, test_idx in splitter.split(np.arange(n_samples))
+            ]
+
+        fold_sizes = np.full(cv, n_samples // cv, dtype=int)
+        fold_sizes[: n_samples % cv] += 1
+        starts = np.cumsum(np.concatenate(([0], fold_sizes[:-1])))
+        splits: list[tuple[NDArray[np.int_], NDArray[np.int_]]] = []
+        for start, fold_size in zip(starts, fold_sizes):
+            test_idx = np.arange(start, start + fold_size)
+            train_mask = np.ones(n_samples, dtype=bool)
+            train_mask[test_idx] = False
+            train_idx = np.arange(n_samples)[train_mask]
+            splits.append((train_idx, test_idx))
+        return splits
 
     def _make_estimator(self, degree: int) -> EIKGPolynomialRegressor:
         return EIKGPolynomialRegressor(
@@ -519,7 +586,9 @@ class EIKGPolynomialRegressorCV(RegressorMixin, BaseEstimator):
         fitted_attributes = (
             "selected_degree_",
             "cv_scores_",
+            "cv_fold_scores_",
             "best_score_",
+            "oof_predictions_",
             "estimator_",
             "n_features_in_",
             "feature_names_in_",

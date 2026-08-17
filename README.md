@@ -2,12 +2,13 @@
 
 `EIKGPolynomial` is a lightweight Python package for regression models based on the **elementary image of the Kolmogorov-Gabor polynomial**.
 
-The package provides four sklearn-style estimators:
+The package provides five sklearn-style estimators:
 
 * `EIKGPolynomialRegressor`
 * `EIKGPolynomialRegressorCV`
 * `DeepPolyNetwork`
 * `DeepPolyNetworkCV`
+* `CombinatorialPolynomialNetwork`
 
 ### Network naming and migration
 
@@ -57,10 +58,17 @@ It is not equivalent to direct estimation of the full multivariate polynomial ba
 
 ## Installation
 
-Install the current released version from PyPI:
+The PyPI distribution is named `eikgp-regressor`, while the Python import package is named
+`eikg`. After version 0.2.0 has been published to PyPI, install it with:
 
 ```bash
-pip install eikgp-regressor
+python -m pip install eikgp-regressor==0.2.0
+```
+
+Then import its estimators from `eikg`:
+
+```python
+from eikg import EIKGPolynomialRegressor
 ```
 
 Install from source in editable mode:
@@ -406,9 +414,184 @@ When external preprocessing must itself be fitted inside each fold, put that pre
 transformer placed before `DeepPolyNetworkCV` would otherwise be fitted before the estimator's
 internal folds and could leak target information.
 
+## `CombinatorialPolynomialNetwork`
+
+`CombinatorialPolynomialNetwork` is a two-level stacking estimator that searches for useful
+polynomial relationships on subsets of the original features. It does not construct one full
+multivariate polynomial basis. Instead, it fits an independent `EIKGPolynomialRegressorCV` for
+each allowed feature combination, ranks those candidates by mean cross-validation MSE, and sends
+only the best `top_k` predictions to a final `EIKGPolynomialRegressorCV`:
+
+```text
+feature combinations
+        |
+        +-- EIKGPolynomialRegressorCV candidate 1 --+
+        +-- EIKGPolynomialRegressorCV candidate 2 --+-- mean CV MSE ranking
+        +-- ...                                     |
+                                                    v
+                                                  Top-K
+                                                    |
+                                      selected-candidate OOF matrix
+                                                    |
+                                                    v
+                                     final EIKGPolynomialRegressorCV
+```
+
+For `p` input features and inclusive combination sizes from `r_min` through `r_max`, the number
+of candidates is computed before any combination is materialized or fitted:
+
+```text
+M = sum(comb(p, r) for r = r_min, ..., r_max)
+```
+
+The default search is pairwise (`r_min = r_max = 2`), so `M = p * (p - 1) / 2`. Larger
+combinations are opt-in: evaluating every size from 2 through `p` produces exactly
+`2 ** p - p - 1` candidates.
+
+### Minimal runnable example
+
+```python
+import numpy as np
+
+from eikg import CombinatorialPolynomialNetwork
+
+rng = np.random.default_rng(42)
+X = rng.normal(size=(120, 5))
+signal = 1.4 * X[:, 0] - 0.8 * X[:, 2]
+y = signal + 0.2 * signal**2 + rng.normal(scale=0.08, size=X.shape[0])
+
+network = CombinatorialPolynomialNetwork(
+    top_k=5,
+    min_combination_size=2,
+    max_combination_size=2,
+    max_candidates=1000,
+    max_degree=3,
+    cv=3,
+    regularization="ridge",
+    alpha_ridge=1e-5,
+)
+
+network.fit(X, y)
+prediction = network.predict(X)
+
+print(network.selected_combinations_)
+print(network.selected_degrees_)
+print(network.final_degree_)
+print(network.ranking_[0])
+print(prediction[:5])
+```
+
+At prediction time the estimator evaluates only `selected_combinations_`. Their full-data
+candidate predictions are stacked in ranking order and passed to `final_estimator_`; candidates
+outside Top-K are neither regenerated nor retained as fitted models.
+Repeated calls to `fit` replace the ranking, selected models, OOF matrix, final estimator, and
+feature metadata instead of accumulating candidates from earlier data.
+
+### Main parameters
+
+| Parameter              |                        Type |      Default | Description |
+| ---------------------- | --------------------------: | -----------: | ----------- |
+| `top_k`                |                       `int` |          `5` | Number of highest-ranked candidates passed to the final estimator. |
+| `min_combination_size` |                       `int` |          `2` | Smallest evaluated feature subset; must be at least 2. |
+| `max_combination_size` |                       `int` |          `2` | Largest evaluated feature subset; must not exceed the input width. |
+| `max_candidates`       |                       `int` |       `1000` | Hard pre-fit limit on `M`; exceeding it raises before candidate training starts. |
+| `max_degree`           |                       `int` |          `6` | Maximum degree tested for every candidate and the final estimator. |
+| `cv`                   |                       `int` |          `5` | Number of contiguous folds used by every inner CV estimator. |
+| `regularization`       | `"none"`, `"ridge"`, `None` |    `"ridge"` | Least-squares regularization used at both levels. |
+| `alpha_ridge`          |                     `float` |       `1e-8` | Ridge strength when `regularization="ridge"`. |
+| `fit_intercept`        |                      `bool` |       `True` | Whether both stages of every EIKG learner fit intercepts. |
+| `scale`                |                      `bool` |       `True` | Whether every EIKG learner scales its input columns. |
+| `scale_y`              |                      `bool` |      `False` | Whether every EIKG learner scales the target during fitting. |
+| `normalize_latent`     |                      `bool` |       `True` | Whether every learner normalizes its latent projection. |
+| `dtype`                | `np.float32` or `np.float64` | `np.float64` | Internal numeric dtype. |
+| `copy`                 |                      `bool` |       `True` | Whether validated input arrays are copied. |
+| `check_input`          |                      `bool` |       `True` | Whether inner estimators perform their standard input checks; the network always rejects non-finite data. |
+| `lstsq_rcond`          |           `float` or `None` |       `None` | Cutoff passed to every least-squares solve. |
+
+`top_k`, both combination sizes, `max_candidates`, `max_degree`, and `cv` must be valid positive
+integers (`cv >= 2`, combination sizes at least 2). The estimator raises rather than silently
+clipping when `top_k > M`, when the requested maximum size exceeds the input width, or when
+`M > max_candidates`. The cap error also reports an approximate first-level fit count so the
+user can reduce `max_combination_size` or deliberately raise `max_candidates`.
+
+### Ranking and Top-K selection
+
+Candidate degree selection is always based on `neg_mean_squared_error`; the combinatorial
+estimator intentionally has no public `scoring` switch that could replace its required MSE
+ranking. For candidate `i` with `K = cv` folds:
+
+```text
+cv_mse_mean_i = (mse_i,1 + ... + mse_i,K) / K
+```
+
+`ranking_` is ordered by `cv_mse_mean` from smallest to largest. Exact score ties retain the
+deterministic enumeration order: combination size first, then lexicographic feature positions.
+Every ranking record contains:
+
+| Key                  | Description |
+| -------------------- | ----------- |
+| `rank`               | One-based position in the MSE ranking. |
+| `combination`        | Tuple of zero-based original feature positions. |
+| `feature_names`      | Corresponding DataFrame column names, or `None` for unnamed arrays. |
+| `combination_size`   | Number of original features used by the candidate. |
+| `selected_degree`    | Degree selected inside that candidate's EIKG CV. |
+| `cv_mse_fold_scores` | Positive validation MSE for every fold. |
+| `cv_mse_mean`        | Arithmetic mean of the fold MSE values and the primary ranking key. |
+| `cv_mse_std`         | Population standard deviation of the fold MSE values. |
+| `selected`           | Whether the candidate belongs to Top-K. |
+
+Train MSE, in-sample predictions, and R-squared are not used for candidate ranking.
+
+### OOF features and model-selection caveat
+
+For every selected candidate, `oof_predictions_[:, j]` contains validation-fold predictions of
+that candidate's selected degree. The fold model that produced a row did not train on that row,
+so the final polynomial is not trained on direct in-sample predictions from its first level.
+
+These are nevertheless **post-selection OOF features**. The candidate degree is selected using
+scores from all folds, and the global Top-K combinations are also selected using all fold
+targets. Moreover, the final EIKG model performs its own degree selection on the resulting OOF
+matrix. Consequently, `ranking_`, candidate `best_score_` values, and
+`final_estimator_.best_score_` are model-selection diagnostics, not unbiased estimates of the
+complete network's generalization error.
+
+For an unbiased performance estimate, place the entire `CombinatorialPolynomialNetwork` inside
+an outer cross-validation loop. Each outer training fold must rerun candidate generation,
+degree selection, ranking, Top-K selection, OOF construction, and final fitting; the untouched
+outer validation fold is used only by `predict`. Use a grouped, time-series, or other
+domain-specific outer splitter when ordinary contiguous K-fold validation is inappropriate.
+
+There is deliberately no separate `CombinatorialPolynomialNetworkCV` class. CV is already an
+intrinsic part of every first-level candidate and the final learner. A second built-in wrapper
+would not define a new fitting algorithm and would multiply an already expensive nested search.
+Use scikit-learn `GridSearchCV` when tuning `top_k`, combination sizes, or other network
+parameters, and use an additional outer CV or independent test set when an unbiased estimate of
+that tuning procedure is required.
+
+### Computational cost and limitations
+
+Let `M` be the candidate count, `D = max_degree`, and `K = cv`. Each candidate CV performs
+`D * K` fold fits and one full-data refit, so the first level requires
+`O(M * (D * K + 1))` EIKG fits. The final learner adds another `O(D * K + 1)` fits. Equivalently,
+the complete fit count is proportional to `(M + 1) * (D * K + 1)`, before any external CV.
+Every EIKG fit contains two dense least-squares stages, so elapsed time also depends on sample
+count, combination width, degree, solver backend, and matrix conditioning.
+
+Candidate combinations are generated lazily after the exact cap check. Ranking metadata is
+retained for all `M` candidates, but fitted candidate models are retained only for Top-K. The
+second-level training matrix requires `O(n_samples * top_k)` values. Increasing
+`max_combination_size`, `max_degree`, `cv`, or wrapping the network in external CV multiplies
+runtime quickly; begin with pairwise combinations and a small degree range.
+
+Input arrays and all candidate, OOF, and final predictions must remain finite. NaN and infinite
+values are rejected rather than replaced or filled. The EIKG scaling, latent normalization, and
+thin-SVD Ridge path provide the same numerical safeguards as the base regressors, but they cannot
+make arbitrary extrapolation or extremely large search spaces safe.
+
 ## Numerical stability of polynomial networks
 
-The network applies max-absolute normalization before constructing element-wise feature powers
+`DeepPolyNetwork` and `DeepPolyNetworkCV` apply max-absolute normalization before constructing
+element-wise feature powers
 and scales every intermediate prediction using a value learned from the corresponding training
 data. It computes powers incrementally and checks constructed matrices and layer predictions for
 non-finite values. NaN and infinite inputs are rejected; they are never silently replaced with
@@ -450,12 +633,14 @@ After calling `fit`, the model stores learned parameters and diagnostics:
 
 For `EIKGPolynomialRegressorCV`, the main fitted attributes are:
 
-| Attribute          | Description                                          |
-| ------------------ | ---------------------------------------------------- |
-| `selected_degree_` | Degree selected by cross-validation.                 |
-| `best_score_`      | Best cross-validation score.                         |
-| `cv_scores_`       | Mean cross-validation scores for all tested degrees. |
-| `estimator_`       | Final fitted `EIKGPolynomialRegressor`.              |
+| Attribute          | Description                                                   |
+| ------------------ | ------------------------------------------------------------- |
+| `selected_degree_` | Degree selected by cross-validation.                          |
+| `best_score_`      | Best mean cross-validation score.                             |
+| `cv_scores_`       | Mean cross-validation scores for all tested degrees.          |
+| `cv_fold_scores_`  | Per-fold scores for every tested degree.                      |
+| `oof_predictions_` | Post-selection OOF predictions for `selected_degree_`.        |
+| `estimator_`       | Final fitted `EIKGPolynomialRegressor` on all supplied rows.  |
 
 For `DeepPolyNetwork`, the main fitted attributes are:
 
@@ -508,9 +693,26 @@ best_score_ = layer_best_scores_[-1]
 They do not summarize the earlier decisions and must not be interpreted as an unbiased score
 for the final full-data estimator.
 
+For `CombinatorialPolynomialNetwork`, the main fitted attributes are:
+
+| Attribute                 | Description |
+| ------------------------- | ----------- |
+| `n_candidates_`           | Exact number of evaluated feature combinations. |
+| `top_k_`                  | Validated number of retained candidates. |
+| `ranking_`                | MSE-sorted metadata for every evaluated candidate. |
+| `selected_combinations_`  | Top-K feature-position tuples in ranking order. |
+| `selected_models_`        | Top-K fitted `EIKGPolynomialRegressorCV` instances. |
+| `selected_degrees_`       | Degrees selected for the retained candidates. |
+| `oof_predictions_`        | Top-K post-selection OOF columns used to fit level two. |
+| `final_estimator_`        | Final `EIKGPolynomialRegressorCV` fitted on the OOF matrix. |
+| `final_degree_`           | Degree selected by `final_estimator_`. |
+| `n_features_in_`          | Number of original input features seen during fitting. |
+| `feature_names_in_`       | Original DataFrame columns, when fitting used named columns. |
+| `is_fitted_`              | Whether candidate selection and final fitting completed. |
+
 ## Minimal API
 
-All four estimators follow the standard sklearn-style workflow:
+All five estimators follow the standard sklearn-style workflow:
 
 ```python
 model.fit(X, y)
@@ -529,6 +731,9 @@ score = model.score(X, y)
 * For per-layer latent degrees `d_l`, an upper bound on the effective algebraic degree follows `e_1 = d_1` and `e_l = d_l * max(e_(l-1), l)`. Although explicit width stays at `m + 1`, effective degree and sensitivity can therefore grow rapidly.
 * Max-absolute scaling bounds training powers but cannot guarantee safe extrapolation beyond the observed feature range.
 * `DeepPolyNetworkCV` uses greedy layer-wise selection and does not guarantee the globally best degree tuple. Exhaustive selection would evaluate up to `max_degree ** n_layers` configurations.
+* `CombinatorialPolynomialNetwork` can still be expensive with bounded combination sizes: it evaluates `sum(comb(p, r))` candidates, and every candidate runs degree CV.
+* Its OOF columns exclude each row from the corresponding fold-model fit but remain post-selection because degree and Top-K decisions use all fold scores.
+* The final layer is trained on OOF predictions but receives predictions from full-data candidate refits at inference, which is the usual stacking train/inference distribution shift.
 * Cross-validation diagnostics are selection-biased; reserve independent data or use nested cross-validation for performance estimation.
 * Built-in K-fold selection is not a replacement for a time-series, grouped, or otherwise domain-specific validation design.
 
@@ -539,3 +744,6 @@ ruff check .
 mypy eikg
 pytest
 ```
+
+Maintainers should follow the complete [release checklist](RELEASE.md) for clean builds,
+TestPyPI verification, versioned GitHub Releases, and PyPI Trusted Publishing.
